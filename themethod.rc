@@ -1,0 +1,29 @@
+#include <windows.h>
+#include "resource.h"
+
+1 24 "themethod.manifest"
+
+IDI_APP ICON "themethod.ico"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     2,0,0,0
+PRODUCTVERSION  2,0,0,0
+FILEOS          0x40004
+FILETYPE        0x1
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "041604B0"
+        BEGIN
+            VALUE "FileDescription", "The Method - tarefas na area de trabalho"
+            VALUE "ProductName", "The Method"
+            VALUE "FileVersion", "2.0.0"
+            VALUE "ProductVersion", "2.0.0"
+            VALUE "OriginalFilename", "TheMethod.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x416, 1200
+    END
+END
