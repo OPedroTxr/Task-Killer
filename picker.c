@@ -55,9 +55,9 @@ static void TimePaint(HDC dc, int W, int H)
         int x = x0 + (i % 6) * cw, y = y0 + (i / 6) * ch;
         BOOL sel = i == t_h, hot = t_hotA == TZ_HOUR && t_hotG == i;
         wsprintfW(s, L"%02d", i);
-        if (sel) URound(dc, x + TSZ(3), y + TSZ(2), cw - TSZ(6), ch - TSZ(4), TSZ(8), T.accent, 255);
+        if (sel) URound(dc, x + TSZ(3), y + TSZ(2), cw - TSZ(6), ch - TSZ(4), TSZ(8), T.primary, 255);
         else if (hot) URound(dc, x + TSZ(3), y + TSZ(2), cw - TSZ(6), ch - TSZ(4), TSZ(8), T.surf2, 255);
-        UText(dc, sel ? t_f.smB : t_f.sm, s, x, y, cw, ch, sel ? T.onAccent : T.text, UT_C);
+        UText(dc, sel ? t_f.smB : t_f.sm, s, x, y, cw, ch, sel ? T.onPrimary : T.text, UT_C);
         ZAdd(&t_z, x, y, cw, ch, TZ_HOUR, i);
     }
 
@@ -68,9 +68,9 @@ static void TimePaint(HDC dc, int W, int H)
         int x = x0 + (i % 6) * cw, y = y0 + (i / 6) * ch, v = i * 5;
         BOOL sel = v == t_m, hot = t_hotA == TZ_MIN && t_hotG == v;
         wsprintfW(s, L"%02d", v);
-        if (sel) URound(dc, x + TSZ(3), y + TSZ(2), cw - TSZ(6), ch - TSZ(4), TSZ(8), T.accent, 255);
+        if (sel) URound(dc, x + TSZ(3), y + TSZ(2), cw - TSZ(6), ch - TSZ(4), TSZ(8), T.primary, 255);
         else if (hot) URound(dc, x + TSZ(3), y + TSZ(2), cw - TSZ(6), ch - TSZ(4), TSZ(8), T.surf2, 255);
-        UText(dc, sel ? t_f.smB : t_f.sm, s, x, y, cw, ch, sel ? T.onAccent : T.text, UT_C);
+        UText(dc, sel ? t_f.smB : t_f.sm, s, x, y, cw, ch, sel ? T.onPrimary : T.text, UT_C);
         ZAdd(&t_z, x, y, cw, ch, TZ_MIN, v);
     }
 
@@ -772,4 +772,176 @@ static void ColorOpen(HWND owner, COLORREF initial, const WCHAR *title, ColorCb 
     KChanged(0);
     ShowWindow(k_hwnd, SW_SHOW);
     SetForegroundWindow(k_hwnd);
+}
+
+/* ======================================================================== */
+/* Seletor de dias da semana (repetição)                                    */
+/* ======================================================================== */
+
+enum { DZ_DAY = 1, DZ_WORK, DZ_WEEKEND, DZ_ALL, DZ_OK, DZ_CANCEL };
+
+static HWND    d_hwnd, d_owner;
+static DaysCb  d_cb;
+static void   *d_ctx;
+static int     d_mask, d_hotA, d_hotG, d_downA, d_downG;
+static UiFonts d_f;
+static Zones   d_z;
+static BackBuf d_bb;
+static BOOL    d_tracking, d_done;
+#define DSZ(x) MulDiv((x), (int)d_f.dpi, 96)
+
+static void DaysPaint(HDC dc, int W, int H)
+{
+    static const int order[7] = { 1, 2, 3, 4, 5, 6, 0 };   /* seg … dom */
+    static const struct { const WCHAR *t; int act, mask; } pre[3] = {
+        { L"Dias úteis", DZ_WORK, 0x3E }, { L"Fim de semana", DZ_WEEKEND, 0x41 }, { L"Todos", DZ_ALL, WD_ALL } };
+    int i, d = DSZ(38), gap = (W - DSZ(32) - 7 * d) / 6, x, y = DSZ(56), bw, cx;
+    WCHAR lbl[64];
+    ZClear(&d_z);
+    UFill(dc, 0, 0, W, H, T.surf);
+    UText(dc, d_f.h2, L"Repetir nos dias", DSZ(16), DSZ(12), W - DSZ(32), DSZ(32), T.text, UT_L);
+
+    for (i = 0; i < 7; i++) {
+        int wd = order[i];
+        BOOL on = (d_mask & (1 << wd)) != 0, hot = d_hotA == DZ_DAY && d_hotG == wd;
+        float r = d / 2.0f;
+        x = DSZ(16) + i * (d + gap);
+        if (on) UCircle(dc, x + r, y + r, r, hot ? T.primaryHi : T.primary, 255);
+        else {
+            UCircle(dc, x + r, y + r, r, hot ? Mix(T.surf2, T.text, 22) : T.surf2, 255);
+            UCircleLine(dc, x + r, y + r, r - 0.5f, T.border, 255, 1.0f);
+        }
+        UText(dc, on ? d_f.smB : d_f.sm, kWdShort[wd], x, y, d, d, on ? T.onPrimary : T.text, UT_C);
+        ZAdd(&d_z, x, y, d, d, DZ_DAY, wd);
+    }
+
+    /* atalhos */
+    y += d + DSZ(16);
+    cx = DSZ(16);
+    for (i = 0; i < 3; i++) {
+        BOOL sel = (d_mask & WD_ALL) == pre[i].mask;
+        int w = UChip(dc, &d_f, cx, y, DSZ(28), 0, 0, FALSE, pre[i].t, sel, d_hotA == pre[i].act, FALSE);
+        ZAdd(&d_z, cx, y, w, DSZ(28), pre[i].act, 0);
+        cx += w + DSZ(8);
+    }
+
+    /* resumo + botões */
+    DaysLabel(d_mask, lbl, 64);
+    UFill(dc, DSZ(14), H - DSZ(58), W - DSZ(28), 1, T.border);
+    UText(dc, d_f.sm, lbl, DSZ(16), H - DSZ(50), W - DSZ(230), DSZ(36), d_mask ? T.text2 : T.danger, UT_L);
+    bw = DSZ(96);
+    UButton(dc, &d_f, W - DSZ(16) - bw, H - DSZ(48), bw, DSZ(36), L"OK", 0, 0, d_mask && d_hotA == DZ_OK);
+    if (d_mask) ZAdd(&d_z, W - DSZ(16) - bw, H - DSZ(48), bw, DSZ(36), DZ_OK, 0);
+    UButton(dc, &d_f, W - DSZ(24) - bw * 2, H - DSZ(48), bw, DSZ(36), L"Cancelar", 0, 1, d_hotA == DZ_CANCEL);
+    ZAdd(&d_z, W - DSZ(24) - bw * 2, H - DSZ(48), bw, DSZ(36), DZ_CANCEL, 0);
+    PopupBorder(dc, W, H);
+}
+
+static void DaysFinish(BOOL ok)
+{
+    DaysCb cb = d_cb;
+    void *ctx = d_ctx;
+    int mask = d_mask & WD_ALL;
+    d_done = TRUE;
+    d_cb = NULL;
+    if (d_hwnd) DestroyWindow(d_hwnd);
+    if (cb) cb(ctx, ok && mask ? mask : -1);
+}
+
+static void DaysAct(int a, int g)
+{
+    switch (a) {
+    case DZ_DAY:     d_mask ^= 1 << g; break;
+    case DZ_WORK:    d_mask = 0x3E; break;
+    case DZ_WEEKEND: d_mask = 0x41; break;
+    case DZ_ALL:     d_mask = WD_ALL; break;
+    case DZ_OK:      DaysFinish(TRUE); return;
+    case DZ_CANCEL:  DaysFinish(FALSE); return;
+    }
+    InvalidateRect(d_hwnd, NULL, FALSE);
+}
+
+static LRESULT CALLBACK DaysProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_CREATE:
+        d_hwnd = h;
+        UiInit();
+        UiFontsMake(&d_f, GetDpiForWindow(h));
+        UiStyleWindow(h, TRUE);
+        return 0;
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        RECT c;
+        HDC wdc = BeginPaint(h, &ps), dc;
+        GetClientRect(h, &c);
+        dc = BBBegin(&d_bb, wdc, c.right, c.bottom);
+        DaysPaint(dc, c.right, c.bottom);
+        BitBlt(wdc, 0, 0, c.right, c.bottom, dc, 0, 0, SRCCOPY);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_MOUSEMOVE: PopupHover(h, &d_z, &d_hotA, &d_hotG, &d_tracking, l); return 0;
+    case WM_MOUSELEAVE: d_tracking = FALSE; d_hotA = d_hotG = 0; InvalidateRect(h, NULL, FALSE); return 0;
+    case WM_SETCURSOR: if (LOWORD(l) == HTCLIENT && PopupCursor(h, &d_z)) return TRUE; break;
+    case WM_LBUTTONDOWN: {
+        Zone *z = ZHit(&d_z, GET_X_LPARAM(l), GET_Y_LPARAM(l));
+        d_downA = z ? z->act : 0; d_downG = z ? z->arg : 0;
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        Zone *z = ZHit(&d_z, GET_X_LPARAM(l), GET_Y_LPARAM(l));
+        if (z && z->act == d_downA && z->arg == d_downG) DaysAct(z->act, z->arg);
+        return 0;
+    }
+    case WM_CHAR:   /* 1 = seg … 7 = dom */
+        if (w >= L'1' && w <= L'7') DaysAct(DZ_DAY, (int)(w - L'0') % 7);
+        return 0;
+    case WM_KEYDOWN:
+        if (w == VK_ESCAPE) DaysFinish(FALSE);
+        else if (w == VK_RETURN && (d_mask & WD_ALL)) DaysFinish(TRUE);
+        return 0;
+    case WM_ACTIVATE:
+        if (LOWORD(w) == WA_INACTIVE) PostMessageW(h, WM_CLOSE, 0, 0);
+        return 0;
+    case WM_CLOSE: DaysFinish(FALSE); return 0;
+    case WM_DESTROY: {
+        DaysCb cb = d_cb;
+        void *ctx = d_ctx;
+        BOOL done = d_done;
+        HWND owner = d_owner;
+        UiFontsFree(&d_f); ZFree(&d_z); BBFree(&d_bb);
+        UiDone();
+        d_hwnd = NULL; d_owner = NULL; d_cb = NULL;
+        if (!done && cb) cb(ctx, -1);
+        if (owner && IsWindow(owner)) SetForegroundWindow(owner);
+        QCalClosed();
+        return 0;
+    }
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static void DaysOpen(HWND owner, int x, int y, int mask, DaysCb cb, void *ctx)
+{
+    UINT dpi = owner ? GetDpiForWindow(owner) : GetDpiForSystem();
+    int w = MulDiv(372, (int)dpi, 96), hgt = MulDiv(226, (int)dpi, 96);
+    RECT wa;
+    POINT pt;
+    if (d_hwnd) DaysFinish(FALSE);
+    d_owner = owner; d_cb = cb; d_ctx = ctx; d_done = FALSE;
+    d_mask = mask & WD_ALL;
+    d_hotA = d_hotG = 0;
+    pt.x = x; pt.y = y;
+    WorkAreaAt(pt, &wa);
+    if (x + w > wa.right) x = wa.right - w;
+    if (y + hgt > wa.bottom) y = y - hgt - MulDiv(40, (int)dpi, 96);
+    if (x < wa.left) x = wa.left;
+    if (y < wa.top) y = wa.top;
+    CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, CLS_DAYS, L"Dias da semana", WS_POPUP, x, y, w, hgt,
+                    owner, NULL, g_inst, NULL);
+    if (!d_hwnd) return;
+    ShowWindow(d_hwnd, SW_SHOW);
+    SetForegroundWindow(d_hwnd);
 }

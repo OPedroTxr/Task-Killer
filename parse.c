@@ -4,6 +4,8 @@
  *   "Academia toda segunda 7h !alarme"
  *   "Pagar boleto 15/11 !!"
  *   "Tomar remédio todo dia 8h30"
+ *   "Reunião amanhã 14h // levar os slides"   (depois de // vira nota)
+ *   "Proposta do cliente @andamento"          (@ escolhe o estado)
  * O que for reconhecido sai do título e vira data, hora, grupo, tipo etc.
  */
 
@@ -95,6 +97,21 @@ static int WeekdayWord(const WCHAR *f)
     return -1;
 }
 
+/* Dia da semana em qualquer forma: "segunda", "seg", "segundas"; *plural diz se veio no plural. */
+static int WeekdayAny(const WCHAR *f, int *plural)
+{
+    static const WCHAR *ab[7] = { L"dom", L"seg", L"ter", L"qua", L"qui", L"sex", L"sab" };
+    static const WCHAR *pl[7] = { L"domingos", L"segundas", L"tercas", L"quartas", L"quintas", L"sextas", L"sabados" };
+    int i = WeekdayWord(f);
+    *plural = 0;
+    if (i >= 0) return i;
+    for (i = 0; i < 7; i++) {
+        if (!lstrcmpW(f, ab[i])) return i;
+        if (!lstrcmpW(f, pl[i]) || (!lstrcmpW(f, L"segundas-feiras") && i == 1)) { *plural = 1; return i; }
+    }
+    return -1;
+}
+
 static DWORD NextWeekday(DWORD today, int wd)
 {
     DWORD d = today;
@@ -123,13 +140,24 @@ static int Tokenize(const WCHAR *in, QTok *t)
     return n;
 }
 
-static void ParseQuick(const WCHAR *in, DWORD today, Parsed *r)
+static void ParseQuick(const WCHAR *src, DWORD today, Parsed *r)
 {
     QTok t[QP_MAXTOK];
+    WCHAR in[TEXT_MAX * 2];
     int n, i, k, len = 0;
 
     ZeroMemory(r, sizeof *r);
-    r->time = r->type = r->recur = r->prio = -1;
+    r->time = r->type = r->recur = r->prio = r->show = -1;
+    r->wdays = 0;
+    lstrcpynW(in, src, TEXT_MAX * 2);
+    /* "//" no início ou depois de um espaço separa a nota (links como https:// não contam) */
+    for (i = 0; in[i]; i++)
+        if (in[i] == L'/' && in[i + 1] == L'/' && (i == 0 || in[i - 1] == L' ')) {
+            lstrcpynW(r->notes, in + i + 2, TEXT_MAX * 2);
+            CleanText(r->notes);
+            in[i] = 0;
+            break;
+        }
     n = Tokenize(in, t);
 
     for (i = 0; i < n; i++) {
@@ -147,10 +175,24 @@ static void ParseQuick(const WCHAR *in, DWORD today, Parsed *r)
             a->used = TRUE;
             continue;
         }
+        if (a->s[0] == L'@' && a->len > 1) {   /* @estado: "@andamento", "@pausado" */
+            int m = a->len - 1 < NAME_MAX - 1 ? a->len - 1 : NAME_MAX - 1;
+            CopyMemory(r->state, a->s + 1, (SIZE_T)m * sizeof(WCHAR));
+            r->state[m] = 0;
+            for (m = lstrlenW(r->state); m > 0 && (r->state[m - 1] == L',' || r->state[m - 1] == L'.'); m--) r->state[m - 1] = 0;
+            for (m = 0; r->state[m]; m++) if (r->state[m] == L'_') r->state[m] = L' ';
+            a->used = TRUE;
+            continue;
+        }
         if (Is(a, L"!!"))                           { r->prio = 1; a->used = TRUE; continue; }
         if (Is(a, L"!a") || Is(a, L"!alarme"))      { r->type = T_ALARM; a->used = TRUE; continue; }
         if (Is(a, L"!l") || Is(a, L"!lembrete"))    { r->type = T_REMIND; a->used = TRUE; continue; }
         if (Is(a, L"!t") || Is(a, L"!tarefa"))      { r->type = T_TASK; a->used = TRUE; continue; }
+        /* exibição na área de trabalho */
+        if (Is(a, L"!sempre"))                      { r->show = SH_ALWAYS; a->used = TRUE; continue; }
+        if (Is(a, L"!semana"))                      { r->show = SH_WEEK; a->used = TRUE; continue; }
+        if (Is(a, L"!nodia") || Is(a, L"!dia"))     { r->show = SH_DAY; a->used = TRUE; continue; }
+        if (Is(a, L"!oculta") || Is(a, L"!app"))    { r->show = SH_NEVER; a->used = TRUE; continue; }
 
         /* repetição */
         if ((Is(a, L"todo") || Is(a, L"todos")) && b && Is(b, L"dia") && c && Is(c, L"util")) {
@@ -164,8 +206,40 @@ static void ParseQuick(const WCHAR *in, DWORD today, Parsed *r)
         if (Is(a, L"semanalmente"))                 { r->recur = R_WEEKLY; a->used = TRUE; continue; }
         if (Is(a, L"todo") && b && Is(b, L"mes"))   { r->recur = R_MONTHLY; a->used = b->used = TRUE; continue; }
         if (Is(a, L"mensalmente"))                  { r->recur = R_MONTHLY; a->used = TRUE; continue; }
-        if ((Is(a, L"toda") || Is(a, L"todo")) && b && (wd = WeekdayWord(b->f)) >= 0) {
-            r->recur = R_WEEKLY; r->date = NextWeekday(today, wd); a->used = b->used = TRUE; continue;
+        /* lista de dias: "toda seg, qua e sex", "todas as terças e quintas", "às segundas e quartas" */
+        {
+            int j = -1, plural;
+            if ((Is(a, L"toda") || Is(a, L"todo") || Is(a, L"todas") || Is(a, L"todos")) && b) {
+                j = i + 1;
+                if ((Is(&t[j], L"as") || Is(&t[j], L"os")) && j + 1 < n) j++;
+                if (WeekdayAny(t[j].f, &plural) < 0) j = -1;
+            } else if (WeekdayAny(a->f, &plural) >= 0 && plural && i > 0 && !t[i - 1].used &&
+                       ((t[i - 1].len == 2 && (t[i - 1].s[0] == 0xE0 || t[i - 1].s[0] == 0xC0) &&
+                         (t[i - 1].s[1] == L's' || t[i - 1].s[1] == L'S')) ||       /* "às" com acento */
+                        Is(&t[i - 1], L"nas") || Is(&t[i - 1], L"aos"))) {
+                j = i;                       /* "com as quartas de final" não conta */
+                t[i - 1].used = TRUE;
+            }
+            if (j >= 0) {
+                int mask = 0, k2;
+                for (k2 = i; k2 < j; k2++) t[k2].used = TRUE;
+                while (j < n) {
+                    if ((wd = WeekdayAny(t[j].f, &plural)) >= 0) { mask |= 1 << wd; t[j].used = TRUE; j++; continue; }
+                    if (Is(&t[j], L"e") && j + 1 < n && WeekdayAny(t[j + 1].f, &plural) >= 0) { t[j].used = TRUE; j++; continue; }
+                    break;
+                }
+                if (mask && !(mask & (mask - 1))) {                 /* um dia só: toda semana */
+                    for (wd = 0; !(mask & (1 << wd)); wd++) {}
+                    r->recur = R_WEEKLY; r->date = NextWeekday(today, wd);
+                } else if (mask == 0x3E) {
+                    r->recur = R_WEEKDAYS; r->date = AlignToDays(today, mask);
+                } else if (mask == WD_ALL) {
+                    r->recur = R_DAILY;
+                } else {
+                    r->recur = R_DAYS; r->wdays = mask; r->date = AlignToDays(today, mask);
+                }
+                continue;
+            }
         }
 
         /* datas */

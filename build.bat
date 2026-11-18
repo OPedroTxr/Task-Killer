@@ -1,13 +1,17 @@
 @echo off
 rem ==========================================================
-rem  The Method - compila o TheMethod.exe (2 cliques aqui)
+rem  Task Killer - compila o TaskKiller.exe (2 cliques aqui)
 rem  Usa o Visual Studio (MSVC) se existir; senao, MinGW (gcc).
 rem ==========================================================
 setlocal
 cd /d "%~dp0"
-rem fecha o app se estiver aberto (versao antiga "Risca" ou a nova)
+rem fecha o app se estiver aberto (versoes antigas "Risca" e "The Method" ou a nova)
 taskkill /im Risca.exe /f >nul 2>nul
 taskkill /im TheMethod.exe /f >nul 2>nul
+taskkill /im TaskKiller.exe /f >nul 2>nul
+rem espera o Windows liberar o arquivo e apaga o executavel antigo
+ping -n 2 127.0.0.1 >nul
+del /q TaskKiller.exe >nul 2>nul
 
 where cl >nul 2>nul
 if %errorlevel%==0 goto msvc
@@ -27,21 +31,21 @@ if %errorlevel%==0 goto mingw
 goto nocompiler
 
 :msvc
-echo [The Method] Compilando com MSVC...
-rc /nologo /fo themethod.res themethod.rc
+echo [Task Killer] Compilando com MSVC...
+rc /nologo /fo taskkiller.res taskkiller.rc
 if errorlevel 1 goto fail
-cl /nologo /utf-8 /O1 /Os /GS- /MT /W3 /DNDEBUG themethod.c themethod.res /Fe:TheMethod.exe /link /SUBSYSTEM:WINDOWS /MANIFEST:NO /OPT:REF /OPT:ICF
+cl /nologo /utf-8 /O1 /Os /GS- /MT /W3 /DNDEBUG taskkiller.c taskkiller.res /Fe:TaskKiller.exe /link /SUBSYSTEM:WINDOWS /MANIFEST:NO /OPT:REF /OPT:ICF
 if errorlevel 1 goto fail
-del /q themethod.obj themethod.res 2>nul
+del /q taskkiller.obj taskkiller.res 2>nul
 goto ok
 
 :mingw
-echo [The Method] Compilando com MinGW (gcc)...
-windres -O coff themethod.rc -o themethod_res.o
+echo [Task Killer] Compilando com MinGW (gcc)...
+windres -O coff taskkiller.rc -o taskkiller_res.o
 if errorlevel 1 goto fail
-gcc -Os -s -municode -mwindows -o TheMethod.exe themethod.c themethod_res.o -luser32 -lgdi32 -lshell32 -lcomctl32 -lcomdlg32 -ladvapi32 -lwinmm
+gcc -Os -s -municode -mwindows -o TaskKiller.exe taskkiller.c taskkiller_res.o -luser32 -lgdi32 -lshell32 -lcomctl32 -lcomdlg32 -ladvapi32 -lwinmm
 if errorlevel 1 goto fail
-del /q themethod_res.o 2>nul
+del /q taskkiller_res.o 2>nul
 goto ok
 
 :nocompiler
@@ -60,15 +64,22 @@ goto end
 
 :fail
 echo.
-echo [The Method] A compilacao falhou. Veja as mensagens acima.
+echo [Task Killer] A compilacao falhou. Veja as mensagens acima.
 goto end
 
 :ok
+rem o Windows guarda os icones em cache; isto faz o Explorer reler o icone novo
+ie4uinit.exe -show >nul 2>nul
+ie4uinit.exe -ClearIconCache >nul 2>nul
 echo.
-echo [The Method] Pronto: TheMethod.exe criado nesta pasta.
-echo              Abra o TheMethod.exe. Seus dados e o "Iniciar com o Windows"
-echo              da versao Risca sao migrados automaticamente.
-echo              Depois voce pode apagar o Risca.exe antigo.
+echo [Task Killer] Pronto: TaskKiller.exe criado nesta pasta.
+echo              Abra o TaskKiller.exe. Seus dados e o "Iniciar com o Windows"
+echo              das versoes The Method e Risca sao migrados automaticamente.
+echo              Depois voce pode apagar o TheMethod.exe (ou Risca.exe) antigo.
+echo.
+echo              Se algum atalho ainda mostrar o icone antigo, ele aponta para o
+echo              .exe antigo ou foi fixado antes: apague o atalho e crie de novo
+echo              (ou desafixe e fixe de novo na barra de tarefas).
 
 :end
 echo.
