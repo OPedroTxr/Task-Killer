@@ -4,18 +4,20 @@
  * Modo "uma janela": todos os grupos juntos, com o nome de cada grupo.
  * Modo "janela por grupo": cada grupo tem sua própria janela arrastável.
  *
- * Desenho: texto em tons de cinza numa DIB vira máscara de alfa. O canal
- * verde guarda o texto principal (cor escolhida pelo usuário) e o canal
- * vermelho guarda os detalhes na cor do grupo (títulos, marcador de
- * importante). Depois de UpdateLayeredWindow a imagem é descartada.
+ * Desenho: o texto é desenhado em tons de cinza numa DIB e cada canal vira
+ * uma máscara de alfa com sua própria cor:
+ *   verde    → texto principal (cor escolhida pelo usuário)
+ *   vermelho → detalhes na cor do grupo (títulos, marcador de importante)
+ *   azul     → destaque de prazo (âmbar → vermelho conforme se aproxima)
+ * Depois de UpdateLayeredWindow a imagem é descartada.
  */
 
 enum { OR_TASK, OR_HEAD, OR_EMPTY, OR_DATE, OR_HINT };
 
 typedef struct {
-    BYTE    kind;
-    DWORD   id, gid;
-    int     idx, top, h, count;
+    BYTE    kind, tier;
+    DWORD   id, gid, sid;
+    int     idx, top, h, count, notesH, xe;
     BOOL    hit;
     RowAnim ra;
 } ORow;
@@ -32,7 +34,7 @@ typedef struct {
 
 static Overlay g_ov[MAX_GROUPS + 1];
 static int     g_nOv;
-static HFONT   g_fMain, g_fHead, g_fSmall, g_fSym;
+static HFONT   g_fMain, g_fMainB, g_fHead, g_fSmall, g_fSym, g_fSymS;
 static UINT    g_fontDpi;
 static BOOL    g_fontDirty = TRUE;
 static int    *g_vis;
@@ -47,14 +49,38 @@ static Overlay *FindOv(HWND h)
 
 static BOOL GroupOnDesktop(DWORD gid) { Group *g = GetGroup(gid); return g && !(g->flags & GF_HIDDEN); }
 
-static BOOL IsVisible(const Item *it, DWORD today)
+/* Última data mostrada na área de trabalho, conforme "Mostrar tarefas". */
+static DWORD HorizonLimit(DWORD today)
 {
-    if (it->anim) return TRUE;
-    if (it->status != S_PENDING) return FALSE;
-    return it->date == 0 || it->date <= today;
+    if (g_cfg.horizon == H_ALL) return 99991231;
+    if (g_cfg.horizon == H_WEEK) return AddDays(today, 6);
+    return today;
 }
 
-/* Ordem: importantes, atrasadas, por horário, por criação. */
+/* A data da tarefa entra na área de trabalho? (a escolha da tarefa vale mais que a geral) */
+static BOOL DesktopDateOk(const Item *it, DWORD today, DWORD lim)
+{
+    if (!it->date) return TRUE;
+    switch (ShowMode(it)) {
+    case SH_ALWAYS: return TRUE;
+    case SH_WEEK:   return it->date <= AddDays(today, 6);
+    case SH_DAY:    return it->date <= today;
+    }
+    return it->date <= lim;
+}
+
+static BOOL IsVisibleLim(const Item *it, DWORD today, DWORD limit)
+{
+    if (ShowMode(it) == SH_NEVER) return FALSE;
+    if (it->anim == A_OUT) return TRUE;                         /* saindo da tela */
+    if (it->anim) return DesktopDateOk(it, today, limit);       /* entrando ou sendo riscada */
+    if (it->status != S_PENDING) return FALSE;
+    return DesktopDateOk(it, today, limit);
+}
+
+static BOOL IsVisible(const Item *it, DWORD today) { return IsVisibleLim(it, today, HorizonLimit(today)); }
+
+/* Ordem: importantes, atrasadas, por data, por horário, por criação. */
 static int CmpItems(const Item *a, const Item *b, DWORD today)
 {
     DWORD da = a->date ? a->date : today, db = b->date ? b->date : today;
@@ -67,10 +93,11 @@ static int CmpItems(const Item *a, const Item *b, DWORD today)
     return a->id < b->id ? -1 : (a->id > b->id);
 }
 
-/* Itens visíveis hoje de um grupo, já ordenados, em g_vis. */
+/* Itens visíveis de um grupo, já ordenados, em g_vis. */
 static int CollectGroup(DWORD gid, DWORD today)
 {
     int i, j, n = 0;
+    DWORD lim = HorizonLimit(today);
     if (g_capVis < g_n + 1) {
         int nc = g_n + 32;
         int *p = (int *)ReAlloc(g_vis, (SIZE_T)nc * sizeof(int));
@@ -78,7 +105,7 @@ static int CollectGroup(DWORD gid, DWORD today)
         g_vis = p; g_capVis = nc;
     }
     for (i = 0; i < g_n; i++) {
-        if (ItemGroup(&g_items[i]) != gid || !IsVisible(&g_items[i], today)) continue;
+        if (ItemGroup(&g_items[i]) != gid || !IsVisibleLim(&g_items[i], today, lim)) continue;
         j = n++;
         while (j > 0 && CmpItems(&g_items[i], &g_items[g_vis[j - 1]], today) < 0) { g_vis[j] = g_vis[j - 1]; j--; }
         g_vis[j] = i;
@@ -89,9 +116,10 @@ static int CollectGroup(DWORD gid, DWORD today)
 static int PendingInGroup(DWORD gid, DWORD today)
 {
     int i, c = 0;
+    DWORD lim = HorizonLimit(today);
     for (i = 0; i < g_n; i++) {
         const Item *it = &g_items[i];
-        if (it->status == S_PENDING && ItemGroup(it) == gid && (!it->date || it->date <= today)) c++;
+        if (it->status == S_PENDING && ItemGroup(it) == gid && ShowMode(it) != SH_NEVER && DesktopDateOk(it, today, lim)) c++;
     }
     return c;
 }
@@ -99,9 +127,12 @@ static int PendingInGroup(DWORD gid, DWORD today)
 static BOOL GroupHasVisible(DWORD gid, DWORD today)
 {
     int i;
-    for (i = 0; i < g_n; i++) if (ItemGroup(&g_items[i]) == gid && IsVisible(&g_items[i], today)) return TRUE;
+    DWORD lim = HorizonLimit(today);
+    for (i = 0; i < g_n; i++) if (ItemGroup(&g_items[i]) == gid && IsVisibleLim(&g_items[i], today, lim)) return TRUE;
     return FALSE;
 }
+
+static BOOL HasNotes(const Item *it) { return it->notes && it->notes[0]; }
 
 /* ------------------------------------------------------------------------ */
 /* Fontes e animação                                                        */
@@ -117,13 +148,17 @@ static void EnsureFonts(UINT dpi)
 {
     if (!g_fontDirty && dpi == g_fontDpi) return;
     if (g_fMain)  DeleteObject(g_fMain);
+    if (g_fMainB) DeleteObject(g_fMainB);
     if (g_fHead)  DeleteObject(g_fHead);
     if (g_fSmall) DeleteObject(g_fSmall);
     if (g_fSym)   DeleteObject(g_fSym);
+    if (g_fSymS)  DeleteObject(g_fSymS);
     g_fMain  = MkFont(g_cfg.face, g_cfg.size10, g_cfg.weight, g_cfg.italic, dpi);
+    g_fMainB = MkFont(g_cfg.face, g_cfg.size10, g_cfg.weight >= FW_BOLD ? FW_HEAVY : FW_BOLD, g_cfg.italic, dpi);
     g_fHead  = MkFont(g_cfg.face, g_cfg.size10 * 70 / 100, FW_BOLD, FALSE, dpi);
     g_fSmall = MkFont(g_cfg.face, g_cfg.size10 * 74 / 100, FW_NORMAL, FALSE, dpi);
     g_fSym   = MkFont(L"Segoe UI Symbol", g_cfg.size10 * 88 / 100, FW_NORMAL, FALSE, dpi);
+    g_fSymS  = MkFont(L"Segoe UI Symbol", g_cfg.size10 * 70 / 100, FW_NORMAL, FALSE, dpi);
     g_fontDpi = dpi;
     g_fontDirty = FALSE;
 }
@@ -173,11 +208,30 @@ static int Lv(float a, int level)
 }
 #define PRI(a, l) RGB(0, Lv(a, l), 0)   /* canal do texto principal */
 #define ACC(a, l) RGB(Lv(a, l), 0, 0)   /* canal da cor do grupo    */
+#define URG(a, l) RGB(0, 0, Lv(a, l))   /* canal do destaque        */
 
-static void RowPrefix(const Item *it, DWORD today, WCHAR *out)
+/* Cores do destaque de prazo na área de trabalho. */
+static COLORREF TierColor(int tier)
+{
+    switch (tier) {
+    case U_SOON:   return RGB(255, 204, 112);
+    case U_NEAR:   return RGB(255, 164, 64);
+    case U_URGENT:
+    case U_LATE:   return RGB(255, 98, 98);
+    }
+    return RGB(255, 255, 255);
+}
+
+/* Texto antes do título: horário e, se não for hoje, a data. Quando há
+   destaque, a data vira o rótulo relativo ("em 2 dias") depois do título. */
+static void RowPrefix(const Item *it, DWORD today, int tier, WCHAR *out)
 {
     out[0] = 0;
-    if (it->date && it->date < today) FmtDate(it->date, L"dd/MM", out, 12);
+    if (it->date && it->date != today && (tier == U_NONE || tier == U_LATE)) {
+        if (it->date < today) FmtDate(it->date, L"dd/MM", out, 16);
+        else if (it->date == AddDays(today, 1)) lstrcpyW(out, L"amanhã");
+        else FmtDate(it->date, L"ddd dd/MM", out, 16);
+    }
     if (it->time >= 0) {
         WCHAR t[8];
         FmtTime(it->time, t);
@@ -224,11 +278,12 @@ static ORow *AddRow(Overlay *ov, BYTE kind)
 static void RenderOverlay(Overlay *ov)
 {
     UINT dpi;
-    int W, H, pad, lineH, gap, rowH, bulletW, ind, y, k, gi, headH, nTasks = 0;
+    int W, H, pad, lineH, gap, rowH, bulletW, ind, y, k, gi, headH, nTasks = 0, sp, notesW;
     HDC sdc, dc;
     TEXTMETRICW tm, th, ts;
     HGDIOBJ oldFont, oldBmp;
     DWORD today, now;
+    ULONGLONG nowFt;
     BITMAPINFO bi;
     HBITMAP bmp;
     void *bits = NULL;
@@ -242,6 +297,7 @@ static void RenderOverlay(Overlay *ov)
 
     W   = MulDiv(g_cfg.width, (int)dpi, 96);
     pad = MulDiv(12, (int)dpi, 96);
+    sp  = MulDiv(8, (int)dpi, 96);
 
     sdc = GetDC(NULL);
     dc  = CreateCompatibleDC(sdc);
@@ -255,8 +311,10 @@ static void RenderOverlay(Overlay *ov)
     headH   = th.tmHeight + gap * 55 / 100;
     bulletW = lineH * 9 / 10;
     ind     = bulletW + MulDiv(6, (int)dpi, 96);
+    notesW  = W - pad - (pad + ind);
     today   = Today();
     now     = GetTickCount();
+    nowFt   = NowFt();
 
     /* ---- layout ---- */
     ov->nRows = 0;
@@ -288,11 +346,21 @@ static void RenderOverlay(Overlay *ov)
             Item *it = &g_items[g_vis[k]];
             ORow *r = AddRow(ov, OR_TASK);
             if (!r) break;
-            r->ra  = GetAnim(it, now);
-            r->id  = it->id;
-            r->gid = g->id;
-            r->idx = g_vis[k];
-            r->h   = (int)((float)rowH * r->ra.size + 0.5f);
+            r->ra   = GetAnim(it, now);
+            r->id   = it->id;
+            r->gid  = g->id;
+            r->sid  = ItemState(it);
+            r->idx  = g_vis[k];
+            r->tier = g_cfg.emphasis ? (BYTE)Urgency(it, nowFt, NULL, NULL) : U_NONE;
+            if (g_cfg.notesMode == N_FIXED && HasNotes(it) && notesW > 20) {
+                RECT nr;
+                int cap = ts.tmHeight * 3;
+                SetRect(&nr, 0, 0, notesW, 0);
+                SelectObject(dc, g_fSmall);
+                DrawTextW(dc, it->notes, -1, &nr, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
+                r->notesH = (nr.bottom > cap ? cap : nr.bottom) + gap / 4;
+            }
+            r->h   = (int)((float)(rowH + r->notesH) * r->ra.size + 0.5f);
             r->hit = it->status == S_PENDING && (it->anim == A_NONE || it->anim == A_IN);
             nTasks++;
         }
@@ -363,40 +431,93 @@ static void RenderOverlay(Overlay *ov)
         } else {
             Item *it = &g_items[r->idx];
             float a = r->ra.alpha, ck = r->ra.check;
-            WCHAR pre[32];
+            WCHAR pre[40], lbl[32];
             SIZE sz;
-            int x, x0, xe;
-            BOOL hov;
+            int x, x0, xe, avail, lblW = 0, icoW = 0, stW = 0, tier = r->tier;
+            const WCHAR *stName = StateName(r->sid);
+            BOOL hov, strong = tier == U_URGENT || tier == U_LATE, extras = it->anim != A_DONE;
+            BOOL icon = extras && g_cfg.notesMode == N_HOVER && HasNotes(it);
+            HFONT tf = strong ? g_fMainB : g_fMain;
             if (a < 0.004f || r->h <= 0) continue;
             hov = it->id == ov->hover && r->hit;
 
-            /* marcador: ○ → ✓ (importante: na cor do grupo) */
+            /* marcador: ○ → ✓. Cor: prazo próximo > estado > importante (cor do grupo) */
             SelectObject(dc, g_fSym);
             if (ck > 0.01f) SetTextColor(dc, PRI(a, 140 + (int)(115.0f * ck)));
+            else if (tier >= U_NEAR) SetTextColor(dc, URG(a, 255));
+            else if (g_cfg.stateDesk) SetTextColor(dc, ACC(a, hov ? 255 : 225));
             else if (it->prio) SetTextColor(dc, ACC(a, 255));
             else SetTextColor(dc, PRI(a, hov ? 255 : 125));
             SetRect(&rc, pad, top, pad + bulletW, top + lineH);
-            DrawTextW(dc, ck > 0.01f ? L"✓" : (it->prio ? L"●" : L"○"), 1, &rc,
+            DrawTextW(dc, ck > 0.01f ? L"✓" : (it->prio || strong ? L"●" : L"○"), 1, &rc,
                       DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
 
             x = x0 = pad + ind;
             SelectObject(dc, g_fMain);
-            RowPrefix(it, today, pre);
+            RowPrefix(it, today, tier, pre);
             if (pre[0]) {
                 GetTextExtentPoint32W(dc, pre, lstrlenW(pre), &sz);
-                SetTextColor(dc, PRI(a, 135));
+                SetTextColor(dc, tier >= U_NEAR ? URG(a, 255) : PRI(a, 135));
                 SetRect(&rc, x, top, W - pad, top + lineH);
                 DrawTextW(dc, pre, -1, &rc, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
                 x += sz.cx + tm.tmAveCharWidth;
             }
+
+            /* o que vai depois do título: ícone de nota e rótulo do prazo */
+            lbl[0] = 0;
+            if (extras && tier != U_NONE) Urgency(it, nowFt, lbl, NULL);
+            if (lbl[0]) { SelectObject(dc, g_fSmall); GetTextExtentPoint32W(dc, lbl, lstrlenW(lbl), &sz); lblW = sz.cx + sp; }
+            if (icon) { SelectObject(dc, g_fSymS); GetTextExtentPoint32W(dc, L"✎", 1, &sz); icoW = sz.cx + sp; }
+            if (extras && g_cfg.stateDesk == 2) {
+                SelectObject(dc, g_fSmall);
+                GetTextExtentPoint32W(dc, stName, lstrlenW(stName), &sz);
+                stW = sz.cx + sp;
+            }
+            avail = W - pad - lblW - icoW - stW - x;
+            if (avail < lineH * 2) { stW = 0; avail = W - pad - lblW - icoW - x; }
+            if (avail < lineH * 2) { lblW = icoW = 0; lbl[0] = 0; icon = FALSE; avail = W - pad - x; }
+
+            SelectObject(dc, tf);
             GetTextExtentPoint32W(dc, it->text, lstrlenW(it->text), &sz);
-            xe = x + sz.cx;
-            if (xe > W - pad) xe = W - pad;
-            if (x < W - pad) {
+            xe = x + (sz.cx < avail ? sz.cx : (avail > 0 ? avail : 0));
+            if (avail > 0) {
                 SetTextColor(dc, PRI(a, 255));
-                SetRect(&rc, x, top, W - pad, top + lineH);
+                SetRect(&rc, x, top, x + avail, top + lineH);
                 DrawTextW(dc, it->text, -1, &rc, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
             }
+            r->xe = xe;
+            if (icon) {
+                SelectObject(dc, g_fSymS);
+                SetTextColor(dc, PRI(a, hov ? 230 : 140));
+                SetRect(&rc, xe + sp, top, xe + icoW, top + lineH);
+                DrawTextW(dc, L"✎", 1, &rc, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+                r->xe = xe + icoW;
+            }
+            if (stW) {   /* nome do estado, na cor do estado */
+                SelectObject(dc, g_fSmall);
+                SetTextColor(dc, ACC(a, 235));
+                SetRect(&rc, r->xe + sp, top, r->xe + stW, top + lineH);
+                DrawTextW(dc, stName, -1, &rc, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+                r->xe += stW;
+            }
+            if (lbl[0]) {
+                SelectObject(dc, g_fSmall);
+                SetTextColor(dc, URG(a, tier == U_SOON ? 200 : 255));
+                SetRect(&rc, r->xe + sp, top, W - pad, top + lineH);
+                DrawTextW(dc, lbl, -1, &rc, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+                r->xe += lblW;
+            }
+
+            /* notas fixas, logo abaixo do título */
+            if (r->notesH > 0 && r->h > lineH) {
+                int ny = top + lineH - gap / 6, nb = top + lineH + r->notesH - gap / 4;
+                if (nb > top + r->h) nb = top + r->h;
+                SelectObject(dc, g_fSmall);
+                SetTextColor(dc, PRI(a, 155));
+                SetRect(&rc, x0, ny, x0 + notesW, nb);
+                DrawTextW(dc, it->notes, -1, &rc, DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL | DT_END_ELLIPSIS);
+            }
+
             if (r->ra.strike > 0.001f) {
                 int em = tm.tmHeight - tm.tmInternalLeading;
                 int thick = em / 13 < 1 ? 1 : em / 13;
@@ -422,13 +543,15 @@ static void RenderOverlay(Overlay *ov)
     }
     GdiFlush();
 
-    /* ---- composição ---- */
+    /* ---- composição: três máscaras → cores + sombra + alfa pré-multiplicado ---- */
     {
         int N = W * H, i, xx, yy;
         BYTE *px = (BYTE *)bits;
-        BYTE *mp = (BYTE *)Alloc((SIZE_T)N), *ma = (BYTE *)Alloc((SIZE_T)N), *hitY = (BYTE *)Alloc((SIZE_T)H);
+        BYTE *mp = (BYTE *)Alloc((SIZE_T)N), *ma = (BYTE *)Alloc((SIZE_T)N), *mu = (BYTE *)Alloc((SIZE_T)N);
+        BYTE *hitY = (BYTE *)Alloc((SIZE_T)H);
         COLORREF *lc = (COLORREF *)Alloc((SIZE_T)H * sizeof(COLORREF));
-        if (mp && ma && hitY && lc) {
+        COLORREF *uc = (COLORREF *)Alloc((SIZE_T)H * sizeof(COLORREF));
+        if (mp && ma && mu && hitY && lc && uc) {
             int cr = GetRValue(g_cfg.color), cg = GetGValue(g_cfg.color), cb = GetBValue(g_cfg.color);
             int lum = (cr * 299 + cg * 587 + cb * 114) / 1000;
             int sc  = lum < 110 ? 255 : 0;
@@ -436,36 +559,55 @@ static void RenderOverlay(Overlay *ov)
             int rad = MulDiv(10, (int)dpi, 96), hx0 = pad / 2, hx1 = W - pad / 2;
             if (g_cfg.shadow && off < 1) off = 1;
 
-            for (i = 0; i < N; i++) { mp[i] = px[i * 4 + 1]; ma[i] = px[i * 4 + 2]; }
-            for (yy = 0; yy < H; yy++) lc[yy] = g_cfg.color;
+            for (i = 0; i < N; i++) { mu[i] = px[i * 4]; mp[i] = px[i * 4 + 1]; ma[i] = px[i * 4 + 2]; }
+            for (yy = 0; yy < H; yy++) { lc[yy] = g_cfg.color; uc[yy] = TierColor(U_NEAR); }
             for (k = 0; k < ov->nRows; k++) {
                 ORow *r = &ov->rows[k];
                 int a0 = r->top, a1 = r->top + r->h;
                 if (r->kind != OR_HEAD && r->kind != OR_TASK) continue;
-                for (yy = a0 < 0 ? 0 : a0; yy < a1 && yy < H; yy++) lc[yy] = GroupColor(r->gid);
+                for (yy = a0 < 0 ? 0 : a0; yy < a1 && yy < H; yy++) {
+                    lc[yy] = r->kind == OR_TASK && g_cfg.stateDesk ? StateColor(r->sid) : GroupColor(r->gid);
+                    if (r->kind == OR_TASK) uc[yy] = TierColor(r->tier);
+                }
                 if (g_cfg.locked && r->hit) {
-                    a1 = a0 + (r->h < lineH + gap / 2 ? r->h : lineH + gap / 2);
+                    int hb = ov->lineH + r->notesH + ov->gap / 2;
+                    a1 = a0 + (r->h < hb ? r->h : hb);
                     for (yy = a0 < 0 ? 0 : a0; yy < a1 && yy < H; yy++) hitY[yy] = 1;
                 }
             }
 
             for (yy = 0; yy < H; yy++) {
                 int ar = GetRValue(lc[yy]), ag = GetGValue(lc[yy]), ab = GetBValue(lc[yy]);
+                int ur = GetRValue(uc[yy]), ug = GetGValue(uc[yy]), ub = GetBValue(uc[yy]);
                 for (xx = 0; xx < W; xx++) {
-                    int tp, ta, t, s = 0, A, R, G, B;
+                    int tp, ta, tu, w, s = 0, A = 0, R = 0, G = 0, B = 0;
                     i = yy * W + xx;
-                    tp = mp[i]; ta = ma[i];
-                    t = ta + tp * (255 - ta) / 255;
+                    tp = mp[i]; ta = ma[i]; tu = mu[i];
+                    w = tp + ta + tu;
+                    if (w) {
+                        A = 255 - (255 - tp) * (255 - ta) / 255 * (255 - tu) / 255;
+                        R = (cr * tp + ar * ta + ur * tu) * A / (w * 255);
+                        G = (cg * tp + ag * ta + ug * tu) * A / (w * 255);
+                        B = (cb * tp + ab * ta + ub * tu) * A / (w * 255);
+                    }
                     if (off) {
-                        int m1 = 0, m2 = 0;
-                        if (xx >= off && yy >= off) { int j = i - off * W - off; m1 = mp[j] > ma[j] ? mp[j] : ma[j]; }
-                        if (xx >= 2 * off && yy >= 2 * off) { int j = i - 2 * off * W - 2 * off; m2 = (mp[j] > ma[j] ? mp[j] : ma[j]) * 3 / 5; }
+                        int m1 = 0, m2 = 0, j;
+                        if (xx >= off && yy >= off) {
+                            j = i - off * W - off;
+                            m1 = mp[j]; if (ma[j] > m1) m1 = ma[j]; if (mu[j] > m1) m1 = mu[j];
+                        }
+                        if (xx >= 2 * off && yy >= 2 * off) {
+                            j = i - 2 * off * W - 2 * off;
+                            m2 = mp[j]; if (ma[j] > m2) m2 = ma[j]; if (mu[j] > m2) m2 = mu[j];
+                            m2 = m2 * 3 / 5;
+                        }
                         s = (m1 > m2 ? m1 : m2) * 170 / 255;
                     }
-                    A = t + s * (255 - t) / 255;
-                    R = ar * ta / 255 + cr * tp * (255 - ta) / 65025 + sc * s * (255 - t) / 65025;
-                    G = ag * ta / 255 + cg * tp * (255 - ta) / 65025 + sc * s * (255 - t) / 65025;
-                    B = ab * ta / 255 + cb * tp * (255 - ta) / 65025 + sc * s * (255 - t) / 65025;
+                    if (s) {
+                        int add = s * (255 - A) / 255;
+                        R += sc * add / 255; G += sc * add / 255; B += sc * add / 255;
+                        A += add;
+                    }
                     if (!g_cfg.locked) {
                         int pa, pc;
                         PanelPx(xx, yy, W, H, rad, &pa, &pc);
@@ -477,6 +619,7 @@ static void RenderOverlay(Overlay *ov)
                     } else if (A == 0 && hitY[yy] && xx >= hx0 && xx < hx1) {
                         A = 1;
                     }
+                    if (A > 255) A = 255;
                     if (R > A) R = A;
                     if (G > A) G = A;
                     if (B > A) B = A;
@@ -487,7 +630,7 @@ static void RenderOverlay(Overlay *ov)
                 }
             }
         }
-        Free(mp); Free(ma); Free(hitY); Free(lc);
+        Free(mp); Free(ma); Free(mu); Free(hitY); Free(lc); Free(uc);
     }
 
     {
@@ -516,15 +659,182 @@ static void RenderAll(void)
     if (!g_animOn) ScheduleTrim();
 }
 
-static DWORD RowAt(Overlay *ov, int x, int y)
+static ORow *RowObjAt(Overlay *ov, int x, int y)
 {
     int k;
-    if (x < ov->pad / 2 || x >= ov->W - ov->pad / 2) return 0;
+    if (x < ov->pad / 2 || x >= ov->W - ov->pad / 2) return NULL;
     for (k = 0; k < ov->nRows; k++) {
         ORow *r = &ov->rows[k];
-        if (r->kind == OR_TASK && r->hit && y >= r->top && y < r->top + ov->lineH + ov->gap / 2) return r->id;
+        int hb = ov->lineH + r->notesH + ov->gap / 2;
+        if (r->kind == OR_TASK && r->hit && y >= r->top && y < r->top + (r->h < hb ? r->h : hb)) return r;
     }
-    return 0;
+    return NULL;
+}
+
+static DWORD RowAt(Overlay *ov, int x, int y) { ORow *r = RowObjAt(ov, x, y); return r ? r->id : 0; }
+
+/* ------------------------------------------------------------------------ */
+/* Cartão de notas (aparece ao passar o mouse)                              */
+/* ------------------------------------------------------------------------ */
+
+static HWND    g_tip, g_tipOv;
+static DWORD   g_tipId, g_tipPend;
+static UiFonts g_tipF;
+static int     g_tipTitleH, g_tipNotesH;
+#define TPSZ(x) MulDiv((x), (int)g_tipF.dpi, 96)
+#define TIP_W 320
+
+static void TipHide(void)
+{
+    if (g_msg) KillTimer(g_msg, TMR_TIP);
+    g_tipPend = 0;
+    if (g_tip) DestroyWindow(g_tip);
+}
+
+/* Chamado quando o mouse passa para outra tarefa (ou sai). */
+static void TipRequest(Overlay *ov, DWORD id)
+{
+    Item *it;
+    if (g_tip && id == g_tipId) return;
+    TipHide();
+    if (!id || g_cfg.notesMode != N_HOVER || !(it = GetItem(id)) || !HasNotes(it)) return;
+    g_tipPend = id;
+    g_tipOv = ov->hwnd;
+    SetTimer(g_msg, TMR_TIP, 380, NULL);
+}
+
+static void TipMeasure(const Item *it, int W)
+{
+    RECT r;
+    HDC dc = GetDC(NULL);
+    HGDIOBJ o = SelectObject(dc, g_tipF.bold);
+    int inner = W - TPSZ(32);
+    SetRect(&r, 0, 0, inner, 0);
+    DrawTextW(dc, it->text, -1, &r, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
+    g_tipTitleH = r.bottom > g_tipF.lhBase * 2 + 2 ? g_tipF.lhBase * 2 + 2 : r.bottom;
+    SelectObject(dc, g_tipF.base);
+    SetRect(&r, 0, 0, inner, 0);
+    DrawTextW(dc, it->notes, -1, &r, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
+    g_tipNotesH = r.bottom > g_tipF.lhBase * 14 ? g_tipF.lhBase * 14 : r.bottom;
+    SelectObject(dc, o);
+    ReleaseDC(NULL, dc);
+}
+
+static void TipPaint(HDC dc, int W, int H)
+{
+    Item *it = GetItem(g_tipId);
+    WCHAR meta[160], lbl[32], when[48];
+    int x = TPSZ(16), y = TPSZ(14), tier;
+    COLORREF tc;
+    UFill(dc, 0, 0, W, H, T.surf);
+    if (!it) return;
+
+    /* grupo · quando · rótulo do prazo */
+    UCircle(dc, (float)(x + TPSZ(4)), (float)(y + TPSZ(9)), (float)TPSZ(4), GroupColor(ItemGroup(it)), 255);
+    lstrcpynW(meta, GroupName(ItemGroup(it)), 48);
+    lstrcatW(meta, L"  ·  ");
+    lstrcatW(meta, StateName(ItemState(it)));
+    WhenLabel(it->date, it->time, Today(), when, 48);
+    if (when[0]) { lstrcatW(meta, L"  ·  "); lstrcatW(meta, when); }
+    UText(dc, g_tipF.sm, meta, x + TPSZ(14), y, W - x - TPSZ(110), TPSZ(18), T.text2, UT_L);
+    tier = Urgency(it, NowFt(), lbl, NULL);
+    if (lbl[0] && tier != U_NONE) {
+        tc = tier >= U_URGENT ? T.danger : T.warn;
+        UText(dc, g_tipF.smB, lbl, W - TPSZ(110), y, TPSZ(94), TPSZ(18), tc, UT_R);
+    }
+    y += TPSZ(26);
+
+    UText(dc, g_tipF.bold, it->text, x, y, W - TPSZ(32), g_tipTitleH, T.text,
+          DT_WORDBREAK | DT_EDITCONTROL | DT_END_ELLIPSIS);
+    y += g_tipTitleH + TPSZ(10);
+    UFill(dc, x, y, W - TPSZ(32), 1, T.border);
+    y += TPSZ(10);
+    UText(dc, g_tipF.base, it->notes, x, y, W - TPSZ(32), g_tipNotesH, T.text2,
+          DT_WORDBREAK | DT_EDITCONTROL | DT_END_ELLIPSIS);
+    if (!g_win11) {
+        RECT r;
+        HBRUSH b = CreateSolidBrush(T.border);
+        SetRect(&r, 0, 0, W, H);
+        FrameRect(dc, &r, b);
+        DeleteObject(b);
+    }
+}
+
+static LRESULT CALLBACK TipProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_NCHITTEST: return HTTRANSPARENT;   /* o mouse "atravessa" o cartão */
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        RECT c;
+        HDC dc = BeginPaint(h, &ps);
+        GetClientRect(h, &c);
+        TipPaint(dc, c.right, c.bottom);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_DESTROY:
+        UiFontsFree(&g_tipF);
+        UiDone();
+        g_tip = NULL;
+        g_tipId = 0;
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static void TipShow(Overlay *ov, DWORD id)
+{
+    Item *it = GetItem(id);
+    ORow *row = NULL;
+    RECT wr, wa;
+    POINT pt;
+    MONITORINFO mi;
+    UINT dpi;
+    int k, W, H, x, y;
+    if (!it || !HasNotes(it) || !ov->hwnd) return;
+    for (k = 0; k < ov->nRows; k++) if (ov->rows[k].kind == OR_TASK && ov->rows[k].id == id) row = &ov->rows[k];
+    if (!row) return;
+
+    UiLoadTheme();
+    UiInit();
+    dpi = GetDpiForWindow(ov->hwnd);
+    UiFontsMake(&g_tipF, dpi ? dpi : 96);
+    W = TPSZ(TIP_W);
+    TipMeasure(it, W);
+    H = TPSZ(14) + TPSZ(26) + g_tipTitleH + TPSZ(21) + g_tipNotesH + TPSZ(16);
+
+    GetWindowRect(ov->hwnd, &wr);
+    pt.x = wr.left + row->xe; pt.y = wr.top + row->top;
+    mi.cbSize = sizeof mi;
+    if (GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mi)) wa = mi.rcWork;
+    else SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    /* à direita do texto; se não couber, logo abaixo da linha */
+    x = pt.x + TPSZ(14);
+    y = pt.y - TPSZ(6);
+    if (x + W > wa.right) { x = wr.left + ov->pad + ov->lineH; y = pt.y + ov->lineH + TPSZ(4); }
+    if (x + W > wa.right) x = wa.right - W - TPSZ(8);
+    if (x < wa.left) x = wa.left + TPSZ(8);
+    if (y + H > wa.bottom) y = wa.bottom - H - TPSZ(8);
+    if (y < wa.top) y = wa.top;
+
+    g_tipId = id;
+    g_tip = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, CLS_TIP, L"Notas", WS_POPUP,
+                            x, y, W, H, NULL, NULL, g_inst, NULL);
+    if (!g_tip) { UiFontsFree(&g_tipF); UiDone(); g_tipId = 0; return; }
+    UiStyleWindow(g_tip, TRUE);
+    ShowWindow(g_tip, SW_SHOWNOACTIVATE);
+}
+
+static void TipFire(void)
+{
+    Overlay *ov;
+    KillTimer(g_msg, TMR_TIP);
+    ov = FindOv(g_tipOv);
+    if (ov && g_tipPend && ov->hover == g_tipPend) TipShow(ov, g_tipPend);
+    g_tipPend = 0;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -628,6 +938,7 @@ static void CreateOv(DWORD gid, int stackIndex)
 static void DestroyOvAt(int i)
 {
     Overlay *ov = &g_ov[i];
+    if (ov->hwnd == g_tipOv) TipHide();
     ov->dying = TRUE;
     if (ov->hwnd) DestroyWindow(ov->hwnd);
     Free(ov->rows);
@@ -641,6 +952,7 @@ static void SyncOverlays(void)
     DWORD want[MAX_GROUPS + 1], today = Today();
     int nw = 0, i, j;
     if (g_quitting || !g_msg) return;
+    TipHide();
     g_progman = FindWindowW(L"Progman", NULL);
 
     if (g_cfg.layout == 0) want[nw++] = 0;
@@ -739,11 +1051,12 @@ static LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM w, LPARAM l)
             ov->tracking = TRUE;
         }
         id = RowAt(ov, GET_X_LPARAM(l), GET_Y_LPARAM(l));
-        if (id != ov->hover) { ov->hover = id; if (!g_animOn) RenderOverlay(ov); }
+        if (id != ov->hover) { ov->hover = id; TipRequest(ov, id); if (!g_animOn) RenderOverlay(ov); }
         return 0;
     }
     case WM_MOUSELEAVE:
         ov->tracking = FALSE;
+        if (g_tipOv == h) TipHide();
         if (ov->hover) { ov->hover = 0; if (!g_animOn) RenderOverlay(ov); }
         return 0;
 
@@ -752,7 +1065,7 @@ static LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     case WM_LBUTTONUP: {
         DWORD id = RowAt(ov, GET_X_LPARAM(l), GET_Y_LPARAM(l));
-        if (id && id == ov->down) { ov->hover = 0; Complete(id); }
+        if (id && id == ov->down) { ov->hover = 0; TipHide(); Complete(id); }
         if ((ov = FindOv(h)) != NULL) ov->down = 0;
         return 0;
     }
@@ -760,6 +1073,7 @@ static LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM w, LPARAM l)
         POINT pt;
         DWORD id = RowAt(ov, GET_X_LPARAM(l), GET_Y_LPARAM(l));
         GetCursorPos(&pt);
+        TipHide();
         if (id) TaskMenu(id, pt, g_msg, FALSE); else MainMenuAt(pt);
         return 0;
     }

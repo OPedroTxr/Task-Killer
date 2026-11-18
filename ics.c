@@ -19,7 +19,7 @@ static void IcsDate(Buf *b, DWORD d)
 
 static void ExportIcs(HWND owner)
 {
-    WCHAR path[MAX_PATH] = L"The Method.ics", t[80];
+    WCHAR path[MAX_PATH] = L"Task Killer.ics", t[80];
     OPENFILENAMEW of;
     SYSTEMTIME u;
     Buf b = { 0 };
@@ -37,12 +37,12 @@ static void ExportIcs(HWND owner)
     if (!GetSaveFileNameW(&of)) return;
 
     GetSystemTime(&u);
-    BufPut(&b, L"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//The Method//PT-BR\r\nCALSCALE:GREGORIAN\r\n", -1);
+    BufPut(&b, L"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Task Killer//PT-BR\r\nCALSCALE:GREGORIAN\r\n", -1);
     for (i = 0; i < g_n; i++) {
         Item *it = &g_items[i];
         if (it->status != S_PENDING || !it->date) continue;
         count++;
-        BufPut(&b, L"BEGIN:VEVENT\r\nUID:themethod-", -1);
+        BufPut(&b, L"BEGIN:VEVENT\r\nUID:taskkiller-", -1);
         BufNum(&b, it->id);
         BufPut(&b, L"@local\r\n", -1);
         wsprintfW(t, L"DTSTAMP:%04d%02d%02dT%02d%02d%02dZ\r\n", u.wYear, u.wMonth, u.wDay, u.wHour, u.wMinute, u.wSecond);
@@ -71,6 +71,14 @@ static void ExportIcs(HWND owner)
         case R_WEEKDAYS: BufPut(&b, L"RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR\r\n", -1); break;
         case R_WEEKLY:   BufPut(&b, L"RRULE:FREQ=WEEKLY\r\n", -1); break;
         case R_MONTHLY:  BufPut(&b, L"RRULE:FREQ=MONTHLY\r\n", -1); break;
+        case R_DAYS: {
+            static const WCHAR *bd[7] = { L"SU", L"MO", L"TU", L"WE", L"TH", L"FR", L"SA" };
+            int k, n = 0;
+            BufPut(&b, L"RRULE:FREQ=WEEKLY;BYDAY=", -1);
+            for (k = 0; k < 7; k++) if (it->wdays & (1 << k)) { if (n++) BufCh(&b, L','); BufPut(&b, bd[k], 2); }
+            BufPut(&b, L"\r\n", 2);
+            break;
+        }
         }
         if (it->type != T_TASK && it->time >= 0) {
             BufPut(&b, L"BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:", -1);
@@ -96,7 +104,7 @@ typedef struct {
     WCHAR sum[TEXT_MAX], cat[NAME_MAX];
     Buf   desc;
     DWORD date;
-    int   time, recur, prio, added;
+    int   time, recur, prio, added, wdays;
     DWORD today, defGroup;
 } IcsState;
 
@@ -164,7 +172,7 @@ static void IcsLine(IcsState *st, WCHAR *line)
     if (!lstrcmpiW(line, L"BEGIN:VEVENT") || !lstrcmpiW(line, L"BEGIN:VTODO")) {
         st->inEv = TRUE; st->inAlarm = FALSE; st->hasAlarm = FALSE;
         st->sum[0] = 0; st->cat[0] = 0; st->desc.len = 0; if (st->desc.p) st->desc.p[0] = 0;
-        st->date = 0; st->time = -1; st->recur = R_NONE; st->prio = 0;
+        st->date = 0; st->time = -1; st->recur = R_NONE; st->prio = 0; st->wdays = 0;
         return;
     }
     if (!st->inEv) return;
@@ -175,7 +183,7 @@ static void IcsLine(IcsState *st, WCHAR *line)
         if (st->sum[0] && st->date && st->added < 1000) {
             int guard = 0;
             if (st->recur)
-                while (st->date < st->today && ++guard < 20000) st->date = StepDate(st->date, st->recur);
+                while (st->date < st->today && ++guard < 20000) st->date = StepDateM(st->date, st->recur, st->wdays);
             if (st->date >= st->today && !IsDuplicate(st->sum, st->date, st->time)) {
                 Item *it = NewItem();
                 if (it) {
@@ -184,6 +192,8 @@ static void IcsLine(IcsState *st, WCHAR *line)
                     it->group = g ? g->id : st->defGroup;
                     it->type = (st->hasAlarm && st->time >= 0) ? T_REMIND : T_TASK;
                     it->recur = (BYTE)st->recur;
+                    it->wdays = (BYTE)st->wdays;
+                    if (st->recur == R_DAYS) it->date = AlignToDays(it->date, st->wdays);
                     it->prio = (BYTE)st->prio;
                     it->date = st->date;
                     it->time = st->time;
@@ -220,7 +230,20 @@ static void IcsLine(IcsState *st, WCHAR *line)
     } else if (!lstrcmpiW(line, L"DTSTART") || (!lstrcmpiW(line, L"DUE") && !st->date)) IcsParseDate(val, &st->date, &st->time);
     else if (!lstrcmpiW(line, L"RRULE")) {
         if (Contains(val, L"FREQ=DAILY")) st->recur = R_DAILY;
-        else if (Contains(val, L"FREQ=WEEKLY")) st->recur = Contains(val, L"BYDAY=MO,TU,WE,TH,FR") ? R_WEEKDAYS : R_WEEKLY;
+        else if (Contains(val, L"FREQ=WEEKLY")) {
+            static const WCHAR *bd[7] = { L"SU", L"MO", L"TU", L"WE", L"TH", L"FR", L"SA" };
+            const WCHAR *by = val;
+            int k, mask = 0;
+            while (*by && !(by[0] == L'B' && by[1] == L'Y' && by[2] == L'D')) by++;   /* BYDAY= */
+            if (*by) {
+                by += 6;
+                for (; *by && *by != L';'; by++)
+                    for (k = 0; k < 7; k++) if (by[0] == bd[k][0] && by[1] == bd[k][1]) mask |= 1 << k;
+            }
+            if (mask == 0x3E) st->recur = R_WEEKDAYS;
+            else if (mask && (mask & (mask - 1))) { st->recur = R_DAYS; st->wdays = mask; }   /* mais de um dia */
+            else st->recur = R_WEEKLY;
+        }
         else if (Contains(val, L"FREQ=MONTHLY")) st->recur = R_MONTHLY;
     }
 }

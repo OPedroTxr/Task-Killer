@@ -27,6 +27,7 @@ static Item *NewItem(void)
     ZeroMemory(it, sizeof *it);
     it->time = -1;
     it->group = g_cfg.defGroup;
+    it->state = g_cfg.defState;
     return it;
 }
 
@@ -54,10 +55,22 @@ static BOOL NotesEqual(const WCHAR *a, const WCHAR *b)
 }
 
 /* Recalcula se um lembrete já "passou" após mudar data/hora/tipo. */
+/* Se o prazo já passou, a tarefa não deve ser concluída sozinha (foi o usuário quem a quis assim). */
+static void KeepIfPast(Item *it)
+{
+    ULONGLONG d;
+    if (it->status == S_PENDING && it->date && Deadline(it, &d) && d <= NowFt()) it->flags |= F_KEEP;
+}
+
+static int  ShowMode(const Item *it) { return (it->flags & F_SHOW_MASK) >> F_SHOW_SHIFT; }
+static void SetShowMode(Item *it, int m) { it->flags = (BYTE)((it->flags & ~F_SHOW_MASK) | ((m & 7) << F_SHOW_SHIFT)); }
+
 static void ItemTimingChanged(Item *it)
 {
     it->notified = (it->type != T_TASK && it->date && it->time >= 0 &&
                     Stamp(it->date, it->time) < NowStamp()) ? 1 : 0;
+    it->flags &= (BYTE)~F_KEEP;
+    KeepIfPast(it);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -134,6 +147,7 @@ static void MoveGroup(DWORD id, int dir)
     Group t;
     if (i < 0 || j < 0 || j >= g_nGroups) return;
     t = g_groups[i]; g_groups[i] = g_groups[j]; g_groups[j] = t;
+    g_groups[i].order = i; g_groups[j].order = j;   /* senão a ordenação desfaz a troca */
     SortGroups();
 }
 
@@ -243,7 +257,10 @@ static void FmtItem(Buf *b, const Item *it)
     BufNum(b, it->group);    BufCh(b, L'\t');
     BufNum(b, it->prio);     BufCh(b, L'\t');
     BufEsc(b, it->text);     BufCh(b, L'\t');
-    BufEsc(b, it->notes);
+    BufEsc(b, it->notes);    BufCh(b, L'\t');
+    BufNum(b, it->flags & F_ALL); BufCh(b, L'\t');
+    BufNum(b, it->state);    BufCh(b, L'\t');
+    BufNum(b, it->wdays);
     BufPut(b, L"\r\n", 2);
 }
 
@@ -285,22 +302,25 @@ static BOOL ParseItemLine(WCHAR *line, Item *out)
     if (v2 && *q == L'\t') {
         Buf nb = { 0 };
         q++;
-        while (*q && nb.len < NOTES_MAX) {
+        while (*q && *q != L'\t') {
             WCHAR c = *q++;
             if (c == L'\\' && *q) {
                 WCHAR e = *q++;
-                if (e == L'n') { BufPut(&nb, L"\r\n", 2); continue; }
+                if (e == L'n') { if (nb.len < NOTES_MAX) BufPut(&nb, L"\r\n", 2); continue; }
                 c = e == L't' ? L' ' : e;
             }
-            BufCh(&nb, c);
+            if (nb.len < NOTES_MAX) BufCh(&nb, c);
         }
         if (nb.len) out->notes = nb.p; else Free(nb.p);
+        if (*q == L'\t') { q++; out->flags = (BYTE)(ParseNum(&q) & F_ALL); if (((out->flags & F_SHOW_MASK) >> F_SHOW_SHIFT) > SH_NEVER) out->flags &= (BYTE)~F_SHOW_MASK; }   /* v3 */
+        if (*q) out->state = (DWORD)ParseNum(&q);                                                    /* v4 */
+        if (*q) out->wdays = (BYTE)(ParseNum(&q) & WD_ALL);                                          /* v5 */
     }
 
     if (!out->id || !out->text[0]) { FreeItemData(out); return FALSE; }
     if (out->status > S_DELETED) out->status = S_PENDING;
     if (out->type > T_ALARM) out->type = T_TASK;
-    if (out->recur > R_MONTHLY) out->recur = R_NONE;
+    if (out->recur > R_DAYS || (out->recur == R_DAYS && !out->wdays)) out->recur = R_NONE;
     if (out->prio > 1) out->prio = 1;
     if (out->time < -1 || out->time > 2359 || out->time % 100 > 59) out->time = -1;
     if (out->date && !ValidDate(out->date)) out->date = 0;
@@ -311,7 +331,7 @@ static void Save(void)
 {
     Buf b = { 0 };
     int i;
-    BufPut(&b, L"# The Method v2\tid\tparent\tstatus\ttype\trecur\tnotified\tdate\ttime\tcreated\tdone\tgroup\tprio\ttext\tnotes\r\n", -1);
+    BufPut(&b, L"# Task Killer v5\tid\tparent\tstatus\ttype\trecur\tnotified\tdate\ttime\tcreated\tdone\tgroup\tprio\ttext\tnotes\tflags\tstate\tdias\r\n", -1);
     for (i = 0; i < g_n; i++) FmtItem(&b, &g_items[i]);
     if (b.p) WriteUtf8(g_dataPath, b.p, b.len, FALSE);
     Free(b.p);
@@ -386,7 +406,7 @@ static void ArchiveOld(BOOL allDone)
     g_n = j;
     if (any) {
         if (GetFileAttributesW(g_histPath) == INVALID_FILE_ATTRIBUTES)
-            WriteUtf8(g_histPath, L"# The Method - historico (status 1 = concluida, 2 = excluida)\tid\tparent\tstatus\ttype\trecur\tnotified\tdate\ttime\tcreated\tdone\tgroup\tprio\ttext\tnotes\r\n", -1, TRUE);
+            WriteUtf8(g_histPath, L"# Task Killer - historico (status 1 = concluida, 2 = excluida)\tid\tparent\tstatus\ttype\trecur\tnotified\tdate\ttime\tcreated\tdone\tgroup\tprio\ttext\tnotes\tflags\tstate\tdias\r\n", -1, TRUE);
         WriteUtf8(g_histPath, b.p, b.len, TRUE);
         Save();
     }
@@ -401,7 +421,7 @@ static void SaveGroups(void)
 {
     Buf b = { 0 };
     int i;
-    BufPut(&b, L"# The Method grupos v1\tid\tordem\tcor\tx\ty\tflags\tnome\r\n", -1);
+    BufPut(&b, L"# Task Killer grupos v1\tid\tordem\tcor\tx\ty\tflags\tnome\r\n", -1);
     for (i = 0; i < g_nGroups; i++) {
         Group *g = &g_groups[i];
         BufNum(&b, g->id);     BufCh(&b, L'\t');
@@ -450,6 +470,142 @@ static void LoadGroups(void)
     if (!g_nGroups) { NewGroup(L"Geral", kPalette[0]); SaveGroups(); }
     SortGroups();
     if (FindGroup(g_cfg.defGroup) < 0) g_cfg.defGroup = g_groups[0].id;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Estados de andamento — estados.tsv: id ordem cor nome                    */
+/* ------------------------------------------------------------------------ */
+
+static int FindState(DWORD id)
+{
+    int i;
+    for (i = 0; i < g_nStates; i++) if (g_states[i].id == id) return i;
+    return -1;
+}
+
+static State *GetState(DWORD id) { int i = FindState(id); return i < 0 ? NULL : &g_states[i]; }
+
+static DWORD ItemState(const Item *it) { return FindState(it->state) >= 0 ? it->state : g_cfg.defState; }
+
+static COLORREF StateColor(DWORD id) { State *s = GetState(id); return s ? s->color : RGB(236, 238, 242); }
+
+static const WCHAR *StateName(DWORD id) { State *s = GetState(id); return s ? s->name : L"Aguardando"; }
+
+static int StateOrder(DWORD id) { int i = FindState(id); return i < 0 ? 99 : i; }
+
+static void SortStates(void)
+{
+    int i, j;
+    for (i = 1; i < g_nStates; i++) {
+        State t = g_states[i];
+        for (j = i; j > 0 && g_states[j - 1].order > t.order; j--) g_states[j] = g_states[j - 1];
+        g_states[j] = t;
+    }
+    for (i = 0; i < g_nStates; i++) g_states[i].order = i;
+}
+
+static State *NewState(const WCHAR *name, COLORREF color)
+{
+    State *s;
+    if (g_nStates >= MAX_STATES) return NULL;
+    s = &g_states[g_nStates];
+    ZeroMemory(s, sizeof *s);
+    s->id = g_nextStateId++;
+    s->order = g_nStates;
+    s->color = color;
+    lstrcpynW(s->name, name, NAME_MAX);
+    CleanText(s->name);
+    if (!s->name[0]) lstrcpyW(s->name, L"Estado");
+    g_nStates++;
+    return s;
+}
+
+static State *FindStateByName(const WCHAR *name)
+{
+    int i;
+    if (!name[0]) return NULL;
+    for (i = 0; i < g_nStates; i++) if (FoldEqual(g_states[i].name, name)) return &g_states[i];
+    for (i = 0; i < g_nStates; i++) if (FoldContains(g_states[i].name, name)) return &g_states[i];  /* "@andamento" */
+    return NULL;
+}
+
+/* Exclui o estado; as tarefas dele passam para o estado padrão. */
+static BOOL DeleteStateData(DWORD id)
+{
+    int i = FindState(id), k;
+    if (i < 0 || id == g_cfg.defState || g_nStates <= 1) return FALSE;
+    for (k = 0; k < g_n; k++) if (g_items[k].state == id) g_items[k].state = g_cfg.defState;
+    MoveMemory(&g_states[i], &g_states[i + 1], (SIZE_T)(g_nStates - i - 1) * sizeof(State));
+    g_nStates--;
+    SortStates();
+    return TRUE;
+}
+
+static void MoveState(DWORD id, int dir)
+{
+    int i = FindState(id), j = i + dir;
+    State t;
+    if (i < 0 || j < 0 || j >= g_nStates) return;
+    t = g_states[i]; g_states[i] = g_states[j]; g_states[j] = t;
+    g_states[i].order = i; g_states[j].order = j;
+    SortStates();
+}
+
+static void SaveStates(void)
+{
+    Buf b = { 0 };
+    int i;
+    BufPut(&b, L"# Task Killer estados v1\tid\tordem\tcor\tnome\r\n", -1);
+    for (i = 0; i < g_nStates; i++) {
+        State *s = &g_states[i];
+        BufNum(&b, s->id);    BufCh(&b, L'\t');
+        BufNum(&b, s->order); BufCh(&b, L'\t');
+        BufNum(&b, (LONGLONG)s->color); BufCh(&b, L'\t');
+        BufEsc(&b, s->name);
+        BufPut(&b, L"\r\n", 2);
+    }
+    if (b.p) WriteUtf8(g_statesPath, b.p, b.len, FALSE);
+    Free(b.p);
+}
+
+static void DefaultStates(void)
+{
+    NewState(L"Aguardando",   RGB(236, 238, 242));   /* branco   */
+    NewState(L"Em andamento", RGB(245, 196, 64));    /* amarelo  */
+    NewState(L"Em revisão",   RGB(122, 162, 255));   /* azul     */
+    NewState(L"Pausado",      RGB(242, 96, 96));     /* vermelho */
+}
+
+static void LoadStates(void)
+{
+    WCHAR *w = ReadUtf8(g_statesPath), *p, *line;
+    if (w) {
+        p = w;
+        while ((line = NextLine(&p)) != NULL && g_nStates < MAX_STATES) {
+            const WCHAR *q = line;
+            State st;
+            int k = 0;
+            if (!line[0] || line[0] == L'#') continue;
+            ZeroMemory(&st, sizeof st);
+            st.id    = (DWORD)ParseNum(&q);
+            st.order = (int)ParseNum(&q);
+            st.color = (COLORREF)ParseNum(&q);
+            while (*q && k < NAME_MAX - 1) {
+                WCHAR c = *q++;
+                if (c == L'\\' && *q) { WCHAR e = *q++; c = (e == L't' || e == L'n') ? L' ' : e; }
+                st.name[k++] = c;
+            }
+            st.name[k] = 0;
+            CleanText(st.name);
+            if (!st.id || !st.name[0] || FindState(st.id) >= 0) continue;
+            g_states[g_nStates++] = st;
+            if (st.id >= g_nextStateId) g_nextStateId = st.id + 1;
+        }
+        Free(w);
+    }
+    if (!g_nStates) { DefaultStates(); SaveStates(); }
+    SortStates();
+    if (FindState(g_cfg.defState) < 0) g_cfg.defState = g_states[0].id;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -506,12 +662,34 @@ static void LoadConfig(void)
     c->layout    = IniInt(L"organizacao", 0);
     c->hideEmpty = IniInt(L"ocultar_vazios", 1);
     c->theme     = IniInt(L"tema", 0);
+    c->horizon   = IniInt(L"mostrar_tarefas", H_TODAY);
+    c->notesMode = IniInt(L"exibir_notas", N_HOVER);
+    c->emphasis  = IniInt(L"destacar_prazos", 1);
+    c->autoDone  = IniInt(L"concluir_ao_vencer", 1);
+    c->autoSinceDate = IniInt(L"concluir_desde_data", 0);
+    c->autoSinceTime = IniInt(L"concluir_desde_hora", 0);
+    if (c->horizon < H_TODAY || c->horizon > H_ALL) c->horizon = H_TODAY;
+    if (c->notesMode < N_FIXED || c->notesMode > N_APP) c->notesMode = N_HOVER;
+    if (!c->autoSinceDate) {
+        /* primeira vez com esta versão: tarefas já vencidas continuam como estão */
+        c->autoSinceDate = (int)Today();
+        c->autoSinceTime = NowTime();
+        IniPutInt(L"concluir_desde_data", c->autoSinceDate);
+        IniPutInt(L"concluir_desde_hora", c->autoSinceTime);
+    }
     c->mx        = IniInt(L"painel_x", POS_UNSET);
     c->my        = IniInt(L"painel_y", POS_UNSET);
     c->mw        = IniInt(L"painel_w", 0);
     c->mh        = IniInt(L"painel_h", 0);
     c->mmax      = IniInt(L"painel_max", 0);
     c->defGroup  = (DWORD)IniInt(L"grupo_padrao", 1);
+    c->defState  = (DWORD)IniInt(L"estado_padrao", 1);
+    c->sort      = IniInt(L"ordenar", SORT_DATE);
+    c->stateDesk = IniInt(L"estado_area_trabalho", 1);
+    c->panelMode = IniInt(L"painel_modo", 0) ? 1 : 0;
+    c->boardBy   = IniInt(L"cards_colunas", 0) ? 1 : 0;
+    if (c->sort < SORT_DATE || c->sort > SORT_STATE) c->sort = SORT_DATE;
+    if (c->stateDesk < 0 || c->stateDesk > 2) c->stateDesk = 1;
     GetPrivateProfileStringW(L"risca", L"fonte", L"Segoe UI", c->face, LF_FACESIZE, g_iniPath);
     if (!c->face[0]) lstrcpyW(c->face, L"Segoe UI");
 
@@ -558,12 +736,23 @@ static void SaveConfig(void)
     IniPutInt(L"organizacao", g_cfg.layout);
     IniPutInt(L"ocultar_vazios", g_cfg.hideEmpty);
     IniPutInt(L"tema", g_cfg.theme);
+    IniPutInt(L"mostrar_tarefas", g_cfg.horizon);
+    IniPutInt(L"exibir_notas", g_cfg.notesMode);
+    IniPutInt(L"destacar_prazos", g_cfg.emphasis);
+    IniPutInt(L"concluir_ao_vencer", g_cfg.autoDone);
+    IniPutInt(L"concluir_desde_data", g_cfg.autoSinceDate);
+    IniPutInt(L"concluir_desde_hora", g_cfg.autoSinceTime);
     IniPutInt(L"painel_x", g_cfg.mx);
     IniPutInt(L"painel_y", g_cfg.my);
     IniPutInt(L"painel_w", g_cfg.mw);
     IniPutInt(L"painel_h", g_cfg.mh);
     IniPutInt(L"painel_max", g_cfg.mmax);
     IniPutInt(L"grupo_padrao", (int)g_cfg.defGroup);
+    IniPutInt(L"estado_padrao", (int)g_cfg.defState);
+    IniPutInt(L"ordenar", g_cfg.sort);
+    IniPutInt(L"estado_area_trabalho", g_cfg.stateDesk);
+    IniPutInt(L"painel_modo", g_cfg.panelMode);
+    IniPutInt(L"cards_colunas", g_cfg.boardBy);
     WritePrivateProfileStringW(L"risca", L"fonte", g_cfg.face, g_iniPath);
     wsprintfW(b, L"%02X%02X%02X", GetRValue(g_cfg.color), GetGValue(g_cfg.color), GetBValue(g_cfg.color));
     WritePrivateProfileStringW(L"risca", L"cor", b, g_iniPath);
@@ -589,21 +778,27 @@ static void InitPaths(void)
         *s = 0;
     }
     {
-        /* Migração: a versão anterior se chamava "Risca". Se só existir a pasta
-           antiga, ela é renomeada; se não der (arquivo em uso), os arquivos são copiados. */
-        WCHAR old[MAX_PATH];
-        wsprintfW(old, L"%s\\Risca", g_dir);
-        lstrcatW(g_dir, L"\\The Method");
-        if (GetFileAttributesW(g_dir) == INVALID_FILE_ATTRIBUTES && GetFileAttributesW(old) != INVALID_FILE_ATTRIBUTES &&
-            !MoveFileW(old, g_dir)) {
-            static const WCHAR *files[4] = { L"tarefas.tsv", L"historico.tsv", L"config.ini", L"grupos.tsv" };
-            WCHAR a[MAX_PATH + 20], b[MAX_PATH + 20];
-            int i;
-            CreateDirectoryW(g_dir, NULL);
-            for (i = 0; i < 4; i++) {
-                wsprintfW(a, L"%s\\%s", old, files[i]);
-                wsprintfW(b, L"%s\\%s", g_dir, files[i]);
-                CopyFileW(a, b, TRUE);
+        /* Migração dos nomes anteriores ("The Method" e, antes dele, "Risca"):
+           se só existir uma pasta antiga, ela é renomeada; se não der (arquivo
+           em uso), os arquivos são copiados. A mais recente tem preferência. */
+        static const WCHAR *olds[2] = { L"The Method", L"Risca" };
+        static const WCHAR *files[5] = { L"tarefas.tsv", L"historico.tsv", L"config.ini", L"grupos.tsv", L"estados.tsv" };
+        WCHAR base[MAX_PATH], old[MAX_PATH + 16];
+        int o;
+        lstrcpynW(base, g_dir, MAX_PATH);
+        lstrcatW(g_dir, L"\\Task Killer");
+        for (o = 0; o < 2 && GetFileAttributesW(g_dir) == INVALID_FILE_ATTRIBUTES; o++) {
+            wsprintfW(old, L"%s\\%s", base, olds[o]);
+            if (GetFileAttributesW(old) == INVALID_FILE_ATTRIBUTES) continue;
+            if (!MoveFileW(old, g_dir)) {
+                WCHAR a[MAX_PATH + 40], b[MAX_PATH + 40];
+                int i;
+                CreateDirectoryW(g_dir, NULL);
+                for (i = 0; i < 5; i++) {
+                    wsprintfW(a, L"%s\\%s", old, files[i]);
+                    wsprintfW(b, L"%s\\%s", g_dir, files[i]);
+                    CopyFileW(a, b, TRUE);
+                }
             }
         }
     }
@@ -612,6 +807,7 @@ static void InitPaths(void)
     wsprintfW(g_histPath,   L"%s\\historico.tsv", g_dir);
     wsprintfW(g_iniPath,    L"%s\\config.ini", g_dir);
     wsprintfW(g_groupsPath, L"%s\\grupos.tsv", g_dir);
+    wsprintfW(g_statesPath, L"%s\\estados.tsv", g_dir);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -646,14 +842,16 @@ static void AutoSet(BOOL on)
     RegCloseKey(k);
 }
 
-/* Remove a entrada antiga "Risca" do início do Windows e passa para o novo nome. */
+/* Remove as entradas antigas ("The Method", "Risca") do início do Windows e passa para o novo nome. */
 static void AutoMigrate(void)
 {
+    static const WCHAR *olds[2] = { L"The Method", L"Risca" };
     HKEY k;
     BOOL had = FALSE;
+    int i;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, &k) == ERROR_SUCCESS) {
-        had = RegQueryValueExW(k, L"Risca", NULL, NULL, NULL, NULL) == ERROR_SUCCESS;
-        if (had) RegDeleteValueW(k, L"Risca");
+        for (i = 0; i < 2; i++)
+            if (RegQueryValueExW(k, olds[i], NULL, NULL, NULL, NULL) == ERROR_SUCCESS) { had = TRUE; RegDeleteValueW(k, olds[i]); }
         RegCloseKey(k);
     }
     if (had) AutoSet(TRUE);

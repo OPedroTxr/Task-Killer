@@ -14,7 +14,8 @@
 typedef struct {
     BOOL dark;
     COLORREF bg, side, surf, surf2, field, border, seg, text, text2, text3,
-             accent, accentHi, onAccent, danger, success, warn, toast, toastText;
+             accent, accentHi, onAccent, danger, success, warn, toast, toastText,
+             primary, primaryHi, onPrimary;   /* preenchimento dos botões e seleções: #3d48a5 */
 } Theme;
 
 static Theme T;
@@ -29,6 +30,7 @@ static void UiLoadTheme(void)
         T.seg = RGB(52, 55, 63);
         T.text = RGB(236, 237, 240); T.text2 = RGB(160, 164, 173); T.text3 = RGB(108, 112, 122);
         T.accent = RGB(122, 162, 255); T.accentHi = RGB(150, 182, 255); T.onAccent = RGB(12, 16, 28);
+        T.primary = RGB(61, 72, 165); T.primaryHi = RGB(77, 89, 190); T.onPrimary = RGB(255, 255, 255);
         T.danger = RGB(242, 107, 107); T.success = RGB(76, 195, 138); T.warn = RGB(245, 184, 76);
         T.toast = RGB(46, 48, 56);   T.toastText = RGB(236, 237, 240);
     } else {
@@ -36,7 +38,8 @@ static void UiLoadTheme(void)
         T.surf2 = RGB(241, 243, 246); T.field = RGB(246, 247, 249); T.border = RGB(228, 230, 235);
         T.seg = RGB(255, 255, 255);
         T.text = RGB(22, 24, 29);    T.text2 = RGB(91, 96, 107);  T.text3 = RGB(145, 150, 161);
-        T.accent = RGB(61, 99, 245); T.accentHi = RGB(88, 122, 250); T.onAccent = RGB(255, 255, 255);
+        T.accent = RGB(61, 72, 165); T.accentHi = RGB(80, 92, 190); T.onAccent = RGB(255, 255, 255);
+        T.primary = RGB(61, 72, 165); T.primaryHi = RGB(80, 92, 190); T.onPrimary = RGB(255, 255, 255);
         T.danger = RGB(229, 72, 77); T.success = RGB(47, 158, 110); T.warn = RGB(214, 150, 30);
         T.toast = RGB(30, 32, 38);   T.toastText = RGB(244, 245, 247);
     }
@@ -70,6 +73,8 @@ typedef int (WINAPI *GpPathOp_t)(void *, void *, void *);
 typedef int (WINAPI *GpEllipse_t)(void *, void *, float, float, float, float);
 typedef int (WINAPI *GpLine_t)(void *, void *, float, float, float, float);
 typedef int (WINAPI *GpLines_t)(void *, void *, const GpPointF *, int);
+typedef int (WINAPI *GpBmpScan0_t)(int, int, int, int, BYTE *, void **);
+typedef int (WINAPI *GpDrawImg_t)(void *, void *, int, int, int, int);
 
 static struct {
     HMODULE dll;
@@ -89,6 +94,10 @@ static struct {
     GpEllipse_t gp_FillEllipse, gp_DrawEllipse, gp_FillRectangle;
     GpLine_t gp_DrawLine;
     GpLines_t gp_DrawLines;
+    GpBmpScan0_t gp_CreateBitmapFromScan0;   /* opcionais (só para o logo) */
+    GpDrawImg_t gp_DrawImageRectI;
+    GpObj_t gp_DisposeImage;
+    GpSetMode_t gp_SetInterpolationMode;
 } gp;
 
 static void *GpProc(const char *n) { return (void *)GetProcAddress(gp.dll, n); }
@@ -124,6 +133,10 @@ static void UiInit(void)
     gp.gp_FillRectangle      = (GpEllipse_t)GpProc("GdipFillRectangle");
     gp.gp_DrawLine           = (GpLine_t)GpProc("GdipDrawLine");
     gp.gp_DrawLines          = (GpLines_t)GpProc("GdipDrawLines");
+    gp.gp_CreateBitmapFromScan0 = (GpBmpScan0_t)GpProc("GdipCreateBitmapFromScan0");
+    gp.gp_DrawImageRectI     = (GpDrawImg_t)GpProc("GdipDrawImageRectI");
+    gp.gp_DisposeImage       = (GpObj_t)GpProc("GdipDisposeImage");
+    gp.gp_SetInterpolationMode = (GpSetMode_t)GpProc("GdipSetInterpolationMode");
     in.GdiplusVersion = 1; in.DebugEventCallback = NULL;
     in.SuppressBackgroundThread = FALSE; in.SuppressExternalCodecs = TRUE;
     if (!gp.gp_Startup || !gp.gp_Shutdown || !gp.gp_CreateFromHDC || !gp.gp_DeleteGraphics || !gp.gp_DeleteBrush ||
@@ -294,6 +307,65 @@ static void UFill(HDC dc, int x, int y, int w, int h, COLORREF c)
 
 static WCHAR g_uiFace[LF_FACESIZE], g_uiFaceDisp[LF_FACESIZE], g_iconFace[LF_FACESIZE];
 
+/* ------------------------------------------------------------------------ */
+/* Marca: fonte do nome e logo, embutidos no .exe                            */
+/* ------------------------------------------------------------------------ */
+
+static HANDLE g_brandFont;     /* fonte "Dainty Fusion" (privada do processo) */
+static int    g_brandRefs;
+
+static const BYTE *ResData(int id, DWORD *size)
+{
+    HRSRC r = FindResourceW(g_inst, MAKEINTRESOURCEW(id), MAKEINTRESOURCEW(10));   /* RT_RCDATA */
+    HGLOBAL h;
+    *size = 0;
+    if (!r || !(h = LoadResource(g_inst, r))) return NULL;
+    *size = SizeofResource(g_inst, r);
+    return (const BYTE *)LockResource(h);
+}
+
+/* Carrega a fonte só enquanto o painel está aberto. */
+static void BrandLoad(void)
+{
+    DWORD size, n = 0;
+    const BYTE *p;
+    if (g_brandRefs++) return;
+    p = ResData(IDR_FONT, &size);
+    if (p && size) g_brandFont = AddFontMemResourceEx((void *)p, size, NULL, &n);
+}
+
+static void BrandUnload(void)
+{
+    if (g_brandRefs <= 0 || --g_brandRefs) return;
+    if (g_brandFont) RemoveFontMemResourceEx(g_brandFont);
+    g_brandFont = NULL;
+}
+
+static void GdiRound(HDC dc, int x, int y, int w, int h, int r, COLORREF fill, BOOL hasFill, COLORREF line, BOOL hasLine);
+static void UCheck(HDC dc, float cx, float cy, float s, COLORREF c, int a, float pw);
+static void *GpBegin(HDC dc);
+
+/* Logo do app (96x96) redimensionado com suavização; sem GDI+, desenha o antigo. */
+static void ULogo(HDC dc, int x, int y, int size, COLORREF fallback)
+{
+    DWORD n;
+    const BYTE *px = ResData(IDR_LOGO, &n);
+    void *g, *img = NULL;
+    if (px && n >= 96 * 96 * 4 && gp.gp_CreateBitmapFromScan0 && gp.gp_DrawImageRectI && gp.gp_DisposeImage &&
+        (g = GpBegin(dc)) != NULL) {
+        if (gp.gp_SetInterpolationMode) gp.gp_SetInterpolationMode(g, 7);   /* bicúbica de alta qualidade */
+        if (gp.gp_CreateBitmapFromScan0(96, 96, 96 * 4, 0x000E200B /* 32bppPARGB */, (BYTE *)px, &img) == 0) {
+            gp.gp_DrawImageRectI(g, img, x, y, size, size);
+            gp.gp_DisposeImage(img);
+            gp.gp_DeleteGraphics(g);
+            return;
+        }
+        gp.gp_DeleteGraphics(g);
+    }
+    GdiRound(dc, x, y, size, size, size / 4, fallback, TRUE, 0, FALSE);
+    UCheck(dc, x + size / 2.0f, y + size / 2.0f, size / 2.0f, RGB(255, 255, 255), 255, size / 14.0f + 0.2f);
+}
+
 static BOOL FontExists(const WCHAR *face)
 {
     HDC dc = GetDC(NULL);
@@ -325,7 +397,7 @@ static void UiPickFaces(void)
 }
 
 typedef struct {
-    HFONT base, bold, sm, smB, cap, h1, h2, big, edTitle, quick, icon, iconSm, iconLg;
+    HFONT base, bold, sm, smB, cap, h1, h2, big, edTitle, quick, icon, iconSm, iconLg, brand;
     int lhBase, lhTitle, lhQuick;
     UINT dpi;
 } UiFonts;
@@ -349,12 +421,12 @@ static int FontLineH(HFONT f)
 
 static void UiFontsFree(UiFonts *f)
 {
-    HFONT *list[13];
+    HFONT *list[14];
     int i;
     list[0] = &f->base; list[1] = &f->bold; list[2] = &f->sm; list[3] = &f->smB; list[4] = &f->cap;
     list[5] = &f->h1; list[6] = &f->h2; list[7] = &f->big; list[8] = &f->edTitle; list[9] = &f->quick;
-    list[10] = &f->icon; list[11] = &f->iconSm; list[12] = &f->iconLg;
-    for (i = 0; i < 13; i++) if (*list[i]) { DeleteObject(*list[i]); *list[i] = NULL; }
+    list[10] = &f->icon; list[11] = &f->iconSm; list[12] = &f->iconLg; list[13] = &f->brand;
+    for (i = 0; i < 14; i++) if (*list[i]) { DeleteObject(*list[i]); *list[i] = NULL; }
 }
 
 static void UiFontsMake(UiFonts *f, UINT dpi)
@@ -375,6 +447,8 @@ static void UiFontsMake(UiFonts *f, UINT dpi)
     f->icon    = UiFont(g_iconFace, 110, FW_NORMAL, dpi);
     f->iconSm  = UiFont(g_iconFace, 90, FW_NORMAL, dpi);
     f->iconLg  = UiFont(g_iconFace, 200, FW_NORMAL, dpi);
+    f->brand   = UiFont(g_brandFont ? L"Dainty Fusion" : g_uiFaceDisp, g_brandFont ? 170 : 125,
+                        g_brandFont ? FW_NORMAL : FW_SEMIBOLD, dpi);
     f->lhBase  = FontLineH(f->base);
     f->lhTitle = FontLineH(f->edTitle);
     f->lhQuick = FontLineH(f->quick);
@@ -439,6 +513,12 @@ static void UIcon(HDC dc, HFONT f, WCHAR glyph, int cx, int cy, COLORREF c)
 #define IC_MORE      0xE712
 #define IC_FOLDER    0xE8B7
 #define IC_TASK      0xE73A
+#define IC_HIDE      0xED1A
+#define IC_SORT      0xE8CB
+#define IC_CHART     0xE9D2
+#define IC_FILTER    0xE71C
+#define IC_EDIT      0xE70F
+#define IC_DESKTOP   0xE7F4
 
 /* ------------------------------------------------------------------------ */
 /* Zonas clicáveis (registradas durante a pintura)                          */
@@ -595,7 +675,7 @@ static void UButton(HDC dc, UiFonts *f, int x, int y, int w, int h, const WCHAR 
     COLORREF fg = T.text, bg = T.surf2;
     int r = h / 4 + 2, tw, ix, gap = icon ? MulDiv(8, (int)f->dpi, 96) : 0, iw = icon ? MulDiv(16, (int)f->dpi, 96) : 0;
     switch (kind) {
-    case 0: bg = hot ? T.accentHi : T.accent; fg = T.onAccent; URound(dc, x, y, w, h, r, bg, 255); break;
+    case 0: bg = hot ? T.primaryHi : T.primary; fg = T.onPrimary; URound(dc, x, y, w, h, r, bg, 255); break;
     case 1: URound(dc, x, y, w, h, r, hot ? Mix(T.surf2, T.text, 18) : T.surf2, 255);
             URoundLine(dc, x, y, w, h, r, T.border, 255, 1.0f); break;
     case 2: if (hot) URound(dc, x, y, w, h, r, T.surf2, 255); fg = T.text2; break;
@@ -611,10 +691,10 @@ static void UToggle(HDC dc, UiFonts *f, int x, int y, BOOL on, BOOL hot)
 {
     int w = MulDiv(40, (int)f->dpi, 96), h = MulDiv(22, (int)f->dpi, 96);
     float kr = (float)h / 2 - MulDiv(4, (int)f->dpi, 96) / 2.0f - 1.0f;
-    if (on) URound(dc, x, y, w, h, h / 2, hot ? T.accentHi : T.accent, 255);
+    if (on) URound(dc, x, y, w, h, h / 2, hot ? T.primaryHi : T.primary, 255);
     else { URound(dc, x, y, w, h, h / 2, hot ? Mix(T.surf2, T.text, 22) : T.surf2, 255); URoundLine(dc, x, y, w, h, h / 2, T.border, 255, 1.0f); }
     UCircle(dc, on ? (float)(x + w - h / 2) : (float)(x + h / 2), (float)y + h / 2.0f, kr,
-            on ? T.onAccent : T.text2, 255);
+            on ? T.onPrimary : T.text2, 255);
 }
 
 /* Controle segmentado; retorna a largura. Registra zonas (act, base + i). */
@@ -641,6 +721,22 @@ static int USegment(HDC dc, UiFonts *f, Zones *zs, int xRight, int y, int h, con
     return total;
 }
 
+/* Largura que UChip vai ocupar (mesma conta). */
+static int UChipW(HDC dc, UiFonts *f, BOOL iconOrDot, const WCHAR *text, BOOL chevron)
+{
+    int pad = MulDiv(11, (int)f->dpi, 96), iw = MulDiv(16, (int)f->dpi, 96), gap = MulDiv(6, (int)f->dpi, 96);
+    int tw = text && text[0] ? UTextW(dc, f->sm, text) : 0;
+    return pad * 2 + (iconOrDot ? iw : 0) + (tw ? (iconOrDot ? gap : 0) + tw : 0) + (chevron ? gap + MulDiv(10, (int)f->dpi, 96) : 0);
+}
+
+/* Bolinha de cor; cores muito claras (ou muito escuras no tema escuro) ganham contorno. */
+static void UDot(HDC dc, float cx, float cy, float r, COLORREF c)
+{
+    int lum = (GetRValue(c) * 299 + GetGValue(c) * 587 + GetBValue(c) * 114) / 1000;
+    UCircle(dc, cx, cy, r, c, 255);
+    if ((!T.dark && lum > 205) || (T.dark && lum < 50)) UCircleLine(dc, cx, cy, r, T.text3, 255, 1.0f);
+}
+
 /* "Chip" arredondado com ícone e texto; retorna a largura. */
 static int UChip(HDC dc, UiFonts *f, int x, int y, int h, WCHAR icon, COLORREF iconColor, BOOL dot,
                  const WCHAR *text, BOOL set, BOOL hot, BOOL chevron)
@@ -651,7 +747,7 @@ static int UChip(HDC dc, UiFonts *f, int x, int y, int h, WCHAR icon, COLORREF i
     int cx = x + pad;
     URound(dc, x, y, w, h, h / 2, hot ? Mix(T.surf2, T.text, 20) : T.surf2, 255);
     if (!set) URoundLine(dc, x, y, w, h, h / 2, T.border, 255, 1.0f);
-    if (dot) UCircle(dc, (float)(cx + iw / 2), (float)y + h / 2.0f, MulDiv(4, (int)f->dpi, 96) + 0.5f, iconColor, 255);
+    if (dot) UDot(dc, (float)(cx + iw / 2), (float)y + h / 2.0f, MulDiv(4, (int)f->dpi, 96) + 0.5f, iconColor);
     else if (icon) UIcon(dc, f->iconSm, icon, cx + iw / 2, y + h / 2, set ? iconColor : T.text3);
     if (icon || dot) cx += iw + (tw ? gap : 0);
     if (tw) UText(dc, f->sm, text, cx, y, tw + 2, h, set ? T.text : T.text3, DT_SINGLELINE | DT_VCENTER);
@@ -663,8 +759,8 @@ static int UChip(HDC dc, UiFonts *f, int x, int y, int h, WCHAR icon, COLORREF i
 static void UCheckCircle(HDC dc, float cx, float cy, float r, BOOL done, BOOL hot, COLORREF ring, float scale)
 {
     if (done) {
-        UCircle(dc, cx, cy, r, T.accent, 255);
-        UCheck(dc, cx, cy, r * 1.05f, T.onAccent, 255, 1.7f * scale);
+        UCircle(dc, cx, cy, r, T.primary, 255);
+        UCheck(dc, cx, cy, r * 1.05f, T.onPrimary, 255, 1.7f * scale);
     } else {
         UCircleLine(dc, cx, cy, r - 0.8f * scale, hot ? T.accent : ring, 255, 1.6f * scale);
         if (hot) UCheck(dc, cx, cy, r * 1.05f, T.accent, 150, 1.6f * scale);

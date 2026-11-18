@@ -15,6 +15,14 @@ static void Changed(void)
     MainRefresh();
 }
 
+static void StatesChanged(void)
+{
+    SaveStates();
+    SaveConfig();
+    RenderAll();
+    MainRefresh();
+}
+
 static void GroupsChanged(void)
 {
     SaveGroups();
@@ -37,33 +45,43 @@ static void ConfigChanged(void)
 /* Ações sobre tarefas                                                      */
 /* ------------------------------------------------------------------------ */
 
-static void Complete(DWORD id)
+/* Marca como concluída (com a animação "feita"). autoDone = foi o fim do prazo.
+   Não salva nem redesenha: quem chama decide (Complete ou o agendador). */
+static BOOL CompleteCore(DWORD id, BOOL autoDone)
 {
     Item *it = GetItem(id);
-    if (!it || it->status != S_PENDING) return;
+    if (!it || it->status != S_PENDING) return FALSE;
     if (it->recur && it->date) {
         /* recorrente: registra a conclusão como cópia e avança a original */
         Item copy = *it, *c;
         copy.notes = StrDupW(it->notes);
         it->date = NextAfter(it, Stamp(Today(), 2359));
         it->notified = 0;
+        it->flags &= (BYTE)~F_KEEP;
+        copy.flags = (BYTE)((copy.flags & F_SHOW_MASK) | (autoDone ? F_AUTO : 0));
         copy.id = g_nextId++;
         copy.parent = id;
         copy.recur = R_NONE;
         copy.status = S_DONE;
         copy.done = NowStamp();
         c = NewItem();             /* pode realocar: 'it' não é mais usado */
-        if (!c) { Free(copy.notes); return; }
+        if (!c) { Free(copy.notes); return FALSE; }
         *c = copy;
         Animate(c, A_DONE);
         g_lastDoneId = copy.id;
     } else {
         it->status = S_DONE;
         it->done = NowStamp();
+        it->flags = (BYTE)((it->flags & F_SHOW_MASK) | (autoDone ? F_AUTO : 0));
         Animate(it, A_DONE);
         g_lastDoneId = id;
     }
-    Changed();
+    return TRUE;
+}
+
+static void Complete(DWORD id)
+{
+    if (CompleteCore(id, FALSE)) Changed();
 }
 
 static void Restore(DWORD id)
@@ -88,6 +106,8 @@ static void Restore(DWORD id)
     }
     it->status = S_PENDING;
     it->done = 0;
+    it->flags &= F_SHOW_MASK;
+    KeepIfPast(it);            /* restaurada depois do prazo: não conclui sozinha de novo */
     Animate(it, A_IN);
     if (g_lastDoneId == id) g_lastDoneId = 0;
     Changed();
@@ -127,6 +147,7 @@ static void UndoDelete(void)
         g_undoDel.notes = NULL;
         Animate(it, A_IN);
     }
+    KeepIfPast(it);
     Changed();
 }
 
@@ -149,6 +170,23 @@ static void MoveToGroup(DWORD id, DWORD gid)
     Changed();
 }
 
+static void SetItemState(DWORD id, DWORD sid)
+{
+    Item *it = GetItem(id);
+    if (!it || !GetState(sid) || it->state == sid) return;
+    it->state = sid;
+    Changed();
+}
+
+static void SetItemShow(DWORD id, int mode)
+{
+    Item *it = GetItem(id);
+    if (!it || mode < SH_DEFAULT || mode > SH_NEVER || ShowMode(it) == mode) return;
+    SetShowMode(it, mode);
+    if (it->status == S_PENDING && IsVisible(it, Today())) Animate(it, A_IN);
+    Changed();
+}
+
 static void TogglePrio(DWORD id)
 {
     Item *it = GetItem(id);
@@ -167,6 +205,7 @@ static void DuplicateItem(DWORD id)
     copy.parent = 0;
     copy.status = S_PENDING;
     copy.done = 0;
+    copy.flags &= F_SHOW_MASK;
     copy.created = NowStamp();
     it = NewItem();
     if (!it) { Free(copy.notes); return; }
@@ -248,6 +287,15 @@ static void ChooseTextColor(HWND owner)
     ColorOpen(owner, g_cfg.color, L"Cor do texto", TextColorCb, NULL);
 }
 
+static void StateColorCb(void *ctx, COLORREF c, int phase)
+{
+    State *s = GetState((DWORD)(ULONG_PTR)ctx);
+    if (!s) return;
+    s->color = c;
+    if (phase == 1) StatesChanged();
+    else { RenderAll(); MainRefresh(); }
+}
+
 static void GroupColorCb(void *ctx, COLORREF c, int phase)
 {
     Group *g = GetGroup((DWORD)(ULONG_PTR)ctx);
@@ -285,12 +333,12 @@ static UINT RunMenu(HMENU m, POINT pt, HWND owner)
     return cmd;
 }
 
-enum { TKM_DONE = 1, TKM_OPEN, TKM_TOMORROW, TKM_PRIO, TKM_DUP, TKM_DELETE, TKM_NEW, TKM_PANEL, TKM_GROUP0 = 100 };
+enum { TKM_DONE = 1, TKM_OPEN, TKM_TOMORROW, TKM_PRIO, TKM_DUP, TKM_DELETE, TKM_NEW, TKM_PANEL, TKM_NOTES, TKM_STATE0 = 30, TKM_SHOW0 = 50, TKM_GROUP0 = 100 };
 
 static void TaskMenu(DWORD id, POINT pt, HWND owner, BOOL fromMain)
 {
     Item *it = GetItem(id);
-    HMENU m, gm;
+    HMENU m, gm, sm, stm;
     UINT c;
     int i;
     BOOL pending;
@@ -298,12 +346,21 @@ static void TaskMenu(DWORD id, POINT pt, HWND owner, BOOL fromMain)
     pending = it->status == S_PENDING;
     m = CreatePopupMenu();
     gm = CreatePopupMenu();
+    sm = CreatePopupMenu();
+    stm = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, TKM_DONE, pending ? L"Concluir" : L"Restaurar");
     AppendMenuW(m, MF_STRING, TKM_OPEN, fromMain ? L"Editar título" : L"Abrir detalhes…");
+    AppendMenuW(m, MF_STRING, TKM_NOTES, it->notes && it->notes[0] ? L"Editar notas…" : L"Adicionar notas…");
     if (pending) AppendMenuW(m, MF_STRING, TKM_TOMORROW, L"Adiar para amanhã");
     for (i = 0; i < g_nGroups; i++)
         AppendMenuW(gm, MF_STRING | (g_groups[i].id == ItemGroup(it) ? MF_CHECKED : 0), (UINT_PTR)(TKM_GROUP0 + i), g_groups[i].name);
+    for (i = 0; i < g_nStates; i++)
+        AppendMenuW(stm, MF_STRING | (g_states[i].id == ItemState(it) ? MF_CHECKED : 0), (UINT_PTR)(TKM_STATE0 + i), g_states[i].name);
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)stm, L"Estado");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)gm, L"Mover para o grupo");
+    for (i = 0; i <= SH_NEVER; i++)
+        AppendMenuW(sm, MF_STRING | (ShowMode(it) == i ? MF_CHECKED : 0), (UINT_PTR)(TKM_SHOW0 + i), kShowMenu[i]);
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)sm, L"Exibir na área de trabalho");
     AppendMenuW(m, MF_STRING | (it->prio ? MF_CHECKED : 0), TKM_PRIO, L"Importante");
     AppendMenuW(m, MF_STRING, TKM_DUP, L"Duplicar");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
@@ -311,7 +368,7 @@ static void TaskMenu(DWORD id, POINT pt, HWND owner, BOOL fromMain)
     if (!fromMain) {
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
         AppendMenuW(m, MF_STRING, TKM_NEW, L"Nova tarefa…\tCtrl+Alt+T");
-        AppendMenuW(m, MF_STRING, TKM_PANEL, L"Abrir The Method");
+        AppendMenuW(m, MF_STRING, TKM_PANEL, L"Abrir o Task Killer");
     }
     c = RunMenu(m, pt, owner);
     switch (c) {
@@ -324,6 +381,7 @@ static void TaskMenu(DWORD id, POINT pt, HWND owner, BOOL fromMain)
         else MainOpen(id);
         break;
     case TKM_TOMORROW: Postpone(id); break;
+    case TKM_NOTES:    MainOpenNotes(id); break;
     case TKM_PRIO:     TogglePrio(id); break;
     case TKM_DUP:      DuplicateItem(id); break;
     case TKM_DELETE:
@@ -334,6 +392,8 @@ static void TaskMenu(DWORD id, POINT pt, HWND owner, BOOL fromMain)
     case TKM_NEW:      QuickOpen(ItemGroup(it)); break;
     case TKM_PANEL:    MainOpen(0); break;
     default:
+        if (c >= TKM_STATE0 && (int)c < TKM_STATE0 + g_nStates) { SetItemState(id, g_states[c - TKM_STATE0].id); break; }
+        if (c >= TKM_SHOW0 && c <= TKM_SHOW0 + SH_NEVER) { SetItemShow(id, (int)(c - TKM_SHOW0)); break; }
         if (c >= TKM_GROUP0 && (int)c < TKM_GROUP0 + g_nGroups) MoveToGroup(id, g_groups[c - TKM_GROUP0].id);
     }
 }
@@ -390,6 +450,42 @@ static void GroupMenu(DWORD gid, POINT pt, HWND owner, BOOL fromMain)
     }
 }
 
+enum { STM_RENAME = 1, STM_COLOR, STM_DEFAULT, STM_UP, STM_DOWN, STM_DELETE };
+
+static void StateMenu(DWORD sid, POINT pt, HWND owner)
+{
+    State *st = GetState(sid);
+    HMENU m;
+    UINT c;
+    int idx;
+    if (!st) return;
+    idx = FindState(sid);
+    m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING, STM_RENAME, L"Renomear");
+    AppendMenuW(m, MF_STRING, STM_COLOR, L"Cor…");
+    AppendMenuW(m, MF_STRING | (g_cfg.defState == sid ? MF_CHECKED | MF_GRAYED : 0), STM_DEFAULT, L"Estado padrão para novas tarefas");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING | (idx > 0 ? 0 : MF_GRAYED), STM_UP, L"Mover para cima");
+    AppendMenuW(m, MF_STRING | (idx < g_nStates - 1 ? 0 : MF_GRAYED), STM_DOWN, L"Mover para baixo");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING | (g_cfg.defState == sid || g_nStates <= 1 ? MF_GRAYED : 0), STM_DELETE, L"Excluir estado…");
+    c = RunMenu(m, pt, owner);
+    if (!(st = GetState(sid))) return;
+    switch (c) {
+    case STM_RENAME:  MBeginRenameState(sid); break;
+    case STM_COLOR:   ColorOpen(owner, st->color, L"Cor do estado", StateColorCb, (void *)(ULONG_PTR)sid); break;
+    case STM_DEFAULT: g_cfg.defState = sid; StatesChanged(); break;
+    case STM_UP:      MoveState(sid, -1); StatesChanged(); break;
+    case STM_DOWN:    MoveState(sid, 1); StatesChanged(); break;
+    case STM_DELETE: {
+        WCHAR t[160];
+        wsprintfW(t, L"As tarefas em \"%s\" passam para \"%s\". Nada é apagado.", st->name, StateName(g_cfg.defState));
+        if (ConfirmBox(owner, L"Excluir estado?", t, L"Excluir estado") && DeleteStateData(sid)) { Save(); StatesChanged(); }
+        break;
+    }
+    }
+}
+
 enum { TRM_OPEN = 1, TRM_ADD, TRM_UNDO, TRM_LOCK, TRM_LAY0, TRM_LAY1, TRM_SETTINGS, TRM_EXIT, TRM_RESTORE0 = 1000 };
 
 static void MainMenuAt(POINT pt)
@@ -401,7 +497,7 @@ static void MainMenuAt(POINT pt)
     UINT c;
     Item *last;
 
-    AppendMenuW(m, MF_STRING, TRM_OPEN, L"Abrir The Method");
+    AppendMenuW(m, MF_STRING, TRM_OPEN, L"Abrir o Task Killer");
     SetMenuDefaultItem(m, TRM_OPEN, FALSE);
     AppendMenuW(m, MF_STRING, TRM_ADD, L"Nova tarefa…\tCtrl+Alt+T");
     last = GetItem(g_lastDoneId);
@@ -454,62 +550,12 @@ static void MainMenuAt(POINT pt)
 /* Bandeja                                                                  */
 /* ------------------------------------------------------------------------ */
 
+/* Ícone da bandeja: o mesmo do app, no tamanho pequeno do sistema. */
 static HICON MakeTrayIcon(void)
 {
-    int n = GetSystemMetrics(SM_CXSMICON), i;
-    BITMAPINFO bi;
-    HDC sdc, dc;
-    HBITMAP col, mask;
-    HFONT f;
-    HGDIOBJ ob, of;
-    void *bits = NULL, *mbits;
-    BYTE *px, fg;
-    RECT r;
-    ICONINFO ii;
-    HICON ic;
-
-    if (n < 16) n = 16;
-    ZeroMemory(&bi, sizeof bi);
-    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = n;
-    bi.bmiHeader.biHeight = -n;
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    sdc = GetDC(NULL);
-    dc = CreateCompatibleDC(sdc);
-    col = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
-    if (!col) { DeleteDC(dc); ReleaseDC(NULL, sdc); return LoadIconW(g_inst, MAKEINTRESOURCEW(IDI_APP)); }
-    ob = SelectObject(dc, col);
-    f = CreateFontW(-n, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-                    ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Segoe UI Symbol");
-    of = SelectObject(dc, f);
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB(255, 255, 255));
-    SetRect(&r, 0, 0, n, n);
-    DrawTextW(dc, L"✔", 1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-    GdiFlush();
-    fg = RegFlag(THEME_KEY, L"SystemUsesLightTheme", FALSE) ? 0x1C : 0xFF;
-    px = (BYTE *)bits;
-    for (i = 0; i < n * n; i++) {
-        BYTE a = px[i * 4 + 1];
-        px[i * 4] = px[i * 4 + 1] = px[i * 4 + 2] = fg;
-        px[i * 4 + 3] = a;
-    }
-    SelectObject(dc, of);
-    SelectObject(dc, ob);
-    DeleteObject(f);
-    mbits = Alloc((SIZE_T)(((n + 15) / 16) * 2 * n));
-    mask = CreateBitmap(n, n, 1, 1, mbits);
-    ii.fIcon = TRUE; ii.xHotspot = 0; ii.yHotspot = 0;
-    ii.hbmMask = mask; ii.hbmColor = col;
-    ic = CreateIconIndirect(&ii);
-    DeleteObject(mask);
-    DeleteObject(col);
-    Free(mbits);
-    DeleteDC(dc);
-    ReleaseDC(NULL, sdc);
-    return ic;
+    int n = GetSystemMetrics(SM_CXSMICON);
+    HICON ic = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, n, n, LR_DEFAULTCOLOR);
+    return ic ? ic : LoadIconW(NULL, MAKEINTRESOURCEW(32512));
 }
 
 static void TrayData(NOTIFYICONDATAW *n)
@@ -556,8 +602,8 @@ static void UpdateTip(void)
         if (g_items[i].status == S_PENDING && (!g_items[i].date || g_items[i].date <= t)) c++;
     TrayData(&n);
     n.uFlags = NIF_TIP | NIF_SHOWTIP;
-    if (c == 0) lstrcpyW(n.szTip, L"The Method — tudo em dia");
-    else wsprintfW(n.szTip, L"The Method — %d pendente%s hoje", c, c == 1 ? L"" : L"s");
+    if (c == 0) lstrcpyW(n.szTip, L"Task Killer — tudo em dia");
+    else wsprintfW(n.szTip, L"Task Killer — %d pendente%s hoje", c, c == 1 ? L"" : L"s");
     Shell_NotifyIconW(NIM_MODIFY, &n);
 }
 
@@ -594,6 +640,7 @@ static void EnableDarkMenus(HWND h)
 static void Quit(void)
 {
     NOTIFYICONDATAW n;
+    TipHide();
     g_quitting = TRUE;
     TrayData(&n);
     Shell_NotifyIconW(NIM_DELETE, &n);
@@ -602,6 +649,7 @@ static void Quit(void)
     if (c_hwnd) DestroyWindow(c_hwnd);
     if (a_hwnd) { AlarmSound(FALSE); DestroyWindow(a_hwnd); }
     if (t_hwnd) DestroyWindow(t_hwnd);
+    if (d_hwnd) DaysFinish(FALSE);
     if (k_hwnd) KFinish(FALSE);
     DestroyAllOverlays();
     DestroyWindow(g_msg);
@@ -617,6 +665,7 @@ static void OnSchedule(void)
     if (t != g_lastDay) { g_lastDay = t; ArchiveOld(FALSE); UpdateTip(); SyncOverlays(); MainRefresh(); }
     Reschedule();
     RenderAll();
+    MainRefresh();
 }
 
 static LRESULT CALLBACK MsgProc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -650,6 +699,7 @@ static LRESULT CALLBACK MsgProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_TIMER:
         if (w == TMR_SCHED) OnSchedule();
         else if (w == TMR_ANIM) AnimTick();
+        else if (w == TMR_TIP) TipFire();
         else if (w == TMR_TRIM) {
             KillTimer(h, TMR_TRIM);
             SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
@@ -702,7 +752,9 @@ static void RegClass(const WCHAR *name, WNDPROC proc, UINT style, HICON icon)
     wc.hInstance = g_inst;
     wc.hCursor = LoadCursorW(NULL, MAKEINTRESOURCEW(32512));
     wc.hIcon = icon;
-    wc.hIconSm = icon;
+    wc.hIconSm = icon ? (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
+                                          GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0) : NULL;
+    if (icon && !wc.hIconSm) wc.hIconSm = icon;
     wc.lpfnWndProc = proc;
     wc.lpszClassName = name;
     RegisterClassExW(&wc);
@@ -718,8 +770,8 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE prev, LPWSTR cmd, int show)
 
     g_inst = hi;
 
-    /* instância única: abrir o The Method de novo abre o painel */
-    mtx = CreateMutexW(NULL, FALSE, L"Local\\TheMethod.Instancia");
+    /* instância única: abrir o Task Killer de novo abre o painel */
+    mtx = CreateMutexW(NULL, FALSE, L"Local\\TaskKiller.Instancia");
     if (mtx && GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND o = FindWindowW(CLS_MSG, NULL);
         if (o) {
@@ -738,10 +790,14 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE prev, LPWSTR cmd, int show)
     InitPaths();
     LoadConfig();
     LoadGroups();
+    LoadStates();
     Load();
     {
         int i;
-        for (i = 0; i < g_n; i++) if (FindGroup(g_items[i].group) < 0) g_items[i].group = g_cfg.defGroup;
+        for (i = 0; i < g_n; i++) {
+            if (FindGroup(g_items[i].group) < 0) g_items[i].group = g_cfg.defGroup;
+            if (FindState(g_items[i].state) < 0) g_items[i].state = g_cfg.defState;   /* versões antigas: "Aguardando" */
+        }
     }
     g_lastDay = Today();
     ArchiveOld(FALSE);
@@ -755,6 +811,8 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE prev, LPWSTR cmd, int show)
     RegClass(CLS_ALARM, AlarmProc, CS_DROPSHADOW, appIcon);
     RegClass(CLS_TIME, TimeProc, CS_DROPSHADOW, appIcon);
     RegClass(CLS_COLOR, ColorProc, CS_DROPSHADOW, appIcon);
+    RegClass(CLS_TIP, TipProc, CS_DROPSHADOW, appIcon);
+    RegClass(CLS_DAYS, DaysProc, CS_DROPSHADOW, appIcon);
 
     g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     g_msg = CreateWindowExW(WS_EX_TOOLWINDOW, CLS_MSG, APP, WS_POPUP, 0, 0, 0, 0, NULL, NULL, hi, NULL);

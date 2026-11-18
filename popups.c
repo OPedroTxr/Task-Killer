@@ -97,11 +97,11 @@ static void CalPaint(HDC dc, int W, int H)
             BOOL inMonth = (int)(d / 100 % 100) == c_month, sel = d == c_sel, hot = c_hotA == CZ_DAY && c_hotG == (int)d;
             float rad = (float)CSZ(15);
             wsprintfW(t, L"%d", (int)(d % 100));
-            if (sel) UCircle(dc, (float)cx, (float)cy, rad, T.accent, 255);
+            if (sel) UCircle(dc, (float)cx, (float)cy, rad, T.primary, 255);
             else if (hot) UCircle(dc, (float)cx, (float)cy, rad, T.surf2, 255);
             if (d == today && !sel) UCircleLine(dc, (float)cx, (float)cy, rad - 0.5f, T.accent, 255, 1.4f);
             UText(dc, sel || d == today ? c_f.smB : c_f.sm, t, cx - cw / 2, cy - ch / 2, cw, ch,
-                  sel ? T.onAccent : (inMonth ? T.text : T.text3), UT_C);
+                  sel ? T.onPrimary : (inMonth ? T.text : T.text3), UT_C);
             ZAdd(&c_z, cx - cw / 2, cy - ch / 2, cw, ch, CZ_DAY, (int)d);
             d = AddDays(d, 1);
         }
@@ -226,7 +226,7 @@ static void CalOpen(HWND owner, int x, int y, DWORD date, CalCb cb, void *ctx)
 /* Adição rápida (Ctrl+Alt+T)                                               */
 /* ======================================================================== */
 
-enum { QZ_GROUP = 1, QZ_DATE, QZ_TIME, QZ_TYPE, QZ_RECUR, QZ_PRIO, QZ_ADD, QZ_MORE };
+enum { QZ_GROUP = 1, QZ_DATE, QZ_TIME, QZ_TYPE, QZ_RECUR, QZ_PRIO, QZ_ADD, QZ_MORE, QZ_STATE };
 #define IDC_QEDIT 301
 
 static HWND    q_hwnd, q_edit;
@@ -234,14 +234,14 @@ static UiFonts q_f;
 static Zones   q_z;
 static BackBuf q_bb;
 static Parsed  q_p;
-static DWORD   q_ctxGroup;
+static DWORD   q_ctxGroup, q_ctxState;
 static int     q_hotA, q_hotG, q_downA, q_downG;
 static BOOL    q_tracking, q_keep;
 static HBRUSH  q_brEdit;
-static struct { BOOL group, date, time, type, recur, prio; DWORD gid, d; int t, ty, rc, pr; } q_ov;
+static struct { BOOL group, date, time, type, recur, prio, state; DWORD gid, d, sid; int t, ty, rc, pr, wd; } q_ov;
 #define QSZ(x) MulDiv((x), (int)q_f.dpi, 96)
 
-typedef struct { DWORD gid; WCHAR newName[NAME_MAX]; DWORD date; int time, type, recur, prio; } QEffective;
+typedef struct { DWORD gid, sid; WCHAR newName[NAME_MAX]; DWORD date; int time, type, recur, prio, wdays; } QEffective;
 
 static void QEff(QEffective *e)
 {
@@ -252,7 +252,10 @@ static void QEff(QEffective *e)
     e->type  = q_ov.type ? q_ov.ty : (q_p.type >= 0 ? q_p.type : T_TASK);
     e->recur = q_ov.recur ? q_ov.rc : (q_p.recur >= 0 ? q_p.recur : R_NONE);
     e->prio  = q_ov.prio ? q_ov.pr : (q_p.prio > 0 ? 1 : 0);
+    e->wdays = q_ov.recur ? q_ov.wd : q_p.wdays;
+    if (e->recur == R_DAYS && !(e->wdays & WD_ALL)) e->recur = R_NONE;
     if ((e->time >= 0 || e->recur) && !e->date) e->date = today;
+    if (e->recur == R_DAYS) e->date = AlignToDays(e->date, e->wdays);
     if (e->type != T_TASK && e->time < 0) {   /* lembrete sem hora: próxima hora cheia */
         int hr = NowTime() / 100 + 1;
         if (!e->date) e->date = today;
@@ -264,6 +267,11 @@ static void QEff(QEffective *e)
         Group *g = FindGroupByName(q_p.group);
         if (g) e->gid = g->id; else lstrcpynW(e->newName, q_p.group, NAME_MAX);
     } else e->gid = q_ctxGroup && GetGroup(q_ctxGroup) ? q_ctxGroup : g_cfg.defGroup;
+    if (q_ov.state) e->sid = q_ov.sid;
+    else {
+        State *st = FindStateByName(q_p.state);
+        e->sid = st ? st->id : (q_ctxState && GetState(q_ctxState) ? q_ctxState : g_cfg.defState);
+    }
 }
 
 static void QParse(void)
@@ -290,13 +298,17 @@ static void QCommit(BOOL details)
     if (!it) return;
     it->id = g_nextId++;
     it->group = e.gid;
+    it->state = e.sid;
     it->date = e.date;
     it->time = e.time;
     it->type = (BYTE)e.type;
     it->recur = (BYTE)e.recur;
+    it->wdays = (BYTE)(e.recur == R_DAYS ? e.wdays : 0);
     it->prio = (BYTE)e.prio;
     it->created = NowStamp();
     lstrcpynW(it->text, q_p.title, TEXT_MAX);
+    if (q_p.notes[0]) ItemSetNotes(it, q_p.notes);
+    if (q_p.show > SH_DEFAULT) SetShowMode(it, q_p.show);
     ItemTimingChanged(it);
     Animate(it, A_IN);
     id = it->id;
@@ -322,6 +334,13 @@ static void QTimeCb(void *ctx, int t)
     if (q_hwnd) InvalidateRect(q_hwnd, NULL, FALSE);
 }
 
+static void QDaysCb(void *ctx, int mask)
+{
+    (void)ctx;
+    if (mask > 0) { q_ov.recur = TRUE; q_ov.rc = R_DAYS; q_ov.wd = mask; }
+    if (q_hwnd) InvalidateRect(q_hwnd, NULL, FALSE);
+}
+
 static void QCalClosed(void)
 {
     if (!q_hwnd || !q_keep) return;
@@ -337,6 +356,16 @@ static void QAct(int a)
     int v;
     QEff(&e);
     switch (a) {
+    case QZ_STATE: {
+        HMENU m = CreatePopupMenu();
+        UINT c;
+        int i;
+        for (i = 0; i < g_nStates; i++)
+            AppendMenuW(m, MF_STRING | (g_states[i].id == e.sid ? MF_CHECKED : 0), (UINT_PTR)(i + 1), g_states[i].name);
+        c = RunMenu(m, pt, q_hwnd);
+        if (c >= 1 && (int)c <= g_nStates) { q_ov.state = TRUE; q_ov.sid = g_states[c - 1].id; }
+        break;
+    }
     case QZ_GROUP: {
         HMENU m = CreatePopupMenu();
         UINT c;
@@ -359,7 +388,12 @@ static void QAct(int a)
         if ((v = UPickMenu(q_hwnd, pt, kTypeName, 3, e.type)) >= 0) { q_ov.type = TRUE; q_ov.ty = v; }
         break;
     case QZ_RECUR:
-        if ((v = UPickMenu(q_hwnd, pt, kRecurName, 5, e.recur)) >= 0) { q_ov.recur = TRUE; q_ov.rc = v; }
+        if ((v = UPickMenu(q_hwnd, pt, kRecurName, 6, e.recur)) == R_DAYS) {
+            q_keep = TRUE;
+            DaysOpen(q_hwnd, pt.x, pt.y, e.recur == R_DAYS ? e.wdays : 0x2A /* seg, qua, sex */, QDaysCb, NULL);
+            return;
+        }
+        if (v >= 0) { q_ov.recur = TRUE; q_ov.rc = v; q_ov.wd = 0; }
         break;
     case QZ_PRIO: q_ov.prio = TRUE; q_ov.pr = !e.prio; break;
     case QZ_ADD:  QCommit(FALSE); return;
@@ -389,6 +423,9 @@ static void QPaint(HDC dc, int W, int H)
     w = UChip(dc, &q_f, x, y, h, 0, gc, TRUE, t, TRUE, q_hotA == QZ_GROUP, TRUE);
     ZAdd(&q_z, x, y, w, h, QZ_GROUP, 0); x += w + gap;
 
+    w = UChip(dc, &q_f, x, y, h, 0, StateColor(e.sid), TRUE, StateName(e.sid), TRUE, q_hotA == QZ_STATE, TRUE);
+    ZAdd(&q_z, x, y, w, h, QZ_STATE, 0); x += w + gap;
+
     if (e.date) DayLabel(e.date, Today(), t, 64); else lstrcpyW(t, L"Data");
     w = UChip(dc, &q_f, x, y, h, IC_CALENDAR, T.accent, FALSE, t, e.date != 0, q_hotA == QZ_DATE, FALSE);
     ZAdd(&q_z, x, y, w, h, QZ_DATE, 0); x += w + gap;
@@ -401,15 +438,23 @@ static void QPaint(HDC dc, int W, int H)
     w = UChip(dc, &q_f, x, y, h, ic, T.accent, FALSE, kTypeName[e.type], e.type != T_TASK, q_hotA == QZ_TYPE, FALSE);
     ZAdd(&q_z, x, y, w, h, QZ_TYPE, 0); x += w + gap;
 
-    w = UChip(dc, &q_f, x, y, h, IC_REPEAT, T.accent, FALSE, e.recur ? kRecurName[e.recur] : L"Repetir",
+    RecurLabel(e.recur, e.wdays, t, 64);
+    w = UChip(dc, &q_f, x, y, h, IC_REPEAT, T.accent, FALSE, e.recur ? t : L"Repetir",
               e.recur != 0, q_hotA == QZ_RECUR, FALSE);
     ZAdd(&q_z, x, y, w, h, QZ_RECUR, 0); x += w + gap;
 
     w = UChip(dc, &q_f, x, y, h, e.prio ? IC_STARFILL : IC_STAR, T.warn, FALSE, NULL, e.prio != 0, q_hotA == QZ_PRIO, FALSE);
     ZAdd(&q_z, x, y, w, h, QZ_PRIO, 0);
+    x += w + gap;
+
+    if (q_p.notes[0] && x < W - QSZ(100)) /* só indica que há nota (o texto vem depois de //) */
+        x += UChip(dc, &q_f, x, y, h, 0xE70B, T.accent, FALSE, L"Nota", TRUE, FALSE, FALSE) + gap;
+    if (q_p.show > SH_DEFAULT && x < W - QSZ(120))
+        UChip(dc, &q_f, x, y, h, q_p.show == SH_NEVER ? IC_HIDE : IC_DESKTOP, T.accent, FALSE, kShowName[q_p.show],
+              TRUE, FALSE, FALSE);
 
     /* rodapé */
-    UText(dc, q_f.sm, L"Ex.: Reunião amanhã 14h #trabalho !lembrete  ·  !! importante",
+    UText(dc, q_f.sm, L"Ex.: Reunião amanhã 14h #trabalho @andamento !lembrete  ·  !! importante  ·  // nota",
           QSZ(20), H - QSZ(46), W - QSZ(260), QSZ(32), T.text3, UT_L);
     bw = QSZ(112);
     UButton(dc, &q_f, W - QSZ(20) - bw, H - QSZ(46), bw, QSZ(32), L"Adicionar", 0, 0, q_hotA == QZ_ADD);
@@ -504,15 +549,16 @@ static void QuickOpen(DWORD gid)
     if (q_hwnd) { SetForegroundWindow(q_hwnd); return; }
     UiLoadTheme();
     q_ctxGroup = gid;
+    q_ctxState = 0;
     ZeroMemory(&q_ov, sizeof q_ov);
     ZeroMemory(&q_p, sizeof q_p);
-    q_p.time = q_p.type = q_p.recur = q_p.prio = -1;
+    q_p.time = q_p.type = q_p.recur = q_p.prio = q_p.show = -1;
     q_keep = FALSE;
     q_hotA = q_hotG = 0;
     GetCursorPos(&pt);
     WorkAreaAt(pt, &wa);
     dpi = GetDpiForSystem();
-    w = MulDiv(680, (int)dpi, 96);
+    w = MulDiv(760, (int)dpi, 96);
     h = MulDiv(176, (int)dpi, 96);
     x = wa.left + (wa.right - wa.left - w) / 2;
     y = wa.top + (wa.bottom - wa.top) * 22 / 100;
@@ -524,7 +570,7 @@ static void QuickOpen(DWORD gid)
         UiFontsMake(&q_f, dpi);
         SendMessageW(q_edit, WM_SETFONT, (WPARAM)q_f.quick, FALSE);
     }
-    w = QSZ(680); h = QSZ(176);
+    w = QSZ(760); h = QSZ(176);
     SetWindowPos(q_hwnd, NULL, wa.left + (wa.right - wa.left - w) / 2, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
     ShowWindow(q_hwnd, SW_SHOW);
     SetForegroundWindow(q_hwnd);
@@ -674,4 +720,11 @@ static void AlarmShow(DWORD id, const WCHAR *text, int time)
     if (!a_hwnd) { Notify(L"Alarme", text); return; }
     AlarmSound(TRUE);
     ShowWindow(a_hwnd, SW_SHOWNOACTIVATE);
+}
+
+/* Adição rápida já num grupo e/ou estado (botão "+" das colunas de cards). */
+static void QuickOpenIn(DWORD gid, DWORD sid)
+{
+    QuickOpen(gid);
+    if (q_hwnd) { q_ctxState = sid; InvalidateRect(q_hwnd, NULL, FALSE); }
 }

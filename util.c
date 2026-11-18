@@ -1,5 +1,7 @@
 /* util.c — memória, texto e datas. */
 
+static int IAbs(int v) { return v < 0 ? -v : v; }
+
 static void *Alloc(SIZE_T n) { return HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, n ? n : 1); }
 static void *ReAlloc(void *p, SIZE_T n) { return p ? HeapReAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, p, n) : Alloc(n); }
 static void  Free(void *p) { if (p) HeapFree(GetProcessHeap(), 0, p); }
@@ -200,13 +202,25 @@ static DWORD StepDate(DWORD d, int recur)
     return d;
 }
 
+static DWORD StepDateM(DWORD d, int recur, int mask)
+{
+    int wd, guard = 0;
+    switch (recur) {
+    case R_DAYS:
+        if (!(mask & WD_ALL)) return AddDays(d, 7);
+        do { d = AddDays(d, 1); wd = WeekDay(d); } while (!(mask & (1 << wd)) && ++guard < 8);
+        return d;
+    }
+    return StepDate(d, recur);
+}
+
 /* Próxima ocorrência de uma tarefa recorrente estritamente depois de 'limit'. */
 static DWORD NextAfter(const Item *it, ULONGLONG limit)
 {
     DWORD d = it->date;
     int guard = 0;
     if (!it->recur || !d) return d;
-    do { d = StepDate(d, it->recur); }
+    do { d = StepDateM(d, it->recur, it->wdays); }
     while (Stamp(d, it->time) <= limit && ++guard < 20000);
     return d;
 }
@@ -249,4 +263,115 @@ static void WhenLabel(DWORD d, int t, DWORD today, WCHAR *out, int cap)
         if (out[0] && lstrlenW(out) + 7 < cap) lstrcatW(out, L"  ");
         if (lstrlenW(out) + 6 < cap) lstrcatW(out, tt);
     }
+}
+
+/* ------------------------------------------------------------------------ */
+/* Prazos                                                                   */
+/* ------------------------------------------------------------------------ */
+
+/* Fim do prazo: data + hora, ou o fim do dia quando não há hora. */
+static BOOL Deadline(const Item *it, ULONGLONG *ft)
+{
+    if (!it->date) return FALSE;
+    if (it->time >= 0) return ToFt(it->date, it->time, ft);
+    return ToFt(AddDays(it->date, 1), 0, ft);
+}
+
+static ULONGLONG DeadlineStamp(const Item *it) { return Stamp(it->date, it->time >= 0 ? it->time : 2359); }
+
+static int DayDiff(DWORD from, DWORD to)
+{
+    ULONGLONG a, b;
+    if (!ToFt(from, -1, &a) || !ToFt(to, -1, &b)) return 0;
+    return (int)((LONGLONG)(b - a) / (LONGLONG)FT_DAY);
+}
+
+/*
+ * Nível de destaque de uma tarefa pendente:
+ *   U_SOON   faltam até 3 dias      U_NEAR  até 24 h
+ *   U_URGENT até 2 h                U_LATE  prazo vencido
+ * 'label' recebe "em 2 dias", "amanhã", "em 5h", "em 40 min", "atrasada"…
+ * 'next'  recebe o próximo instante em que o nível ou o rótulo muda (0 = nunca).
+ */
+static int Urgency(const Item *it, ULONGLONG now, WCHAR *label, ULONGLONG *next)
+{
+    static const ULONGLONG off[4] = { 3 * FT_DAY, FT_DAY, 120 * FT_MIN, 0 };
+    ULONGLONG D, best = 0, ch = 0;
+    LONGLONG r;
+    int tier, i;
+    WCHAR tmp[32];
+    if (!label) label = tmp;
+    label[0] = 0;
+    if (next) *next = 0;
+    if (it->status != S_PENDING || !Deadline(it, &D)) return U_NONE;
+    r = (LONGLONG)(D - now);
+    if (r <= 0) tier = U_LATE;
+    else if (r <= (LONGLONG)(120 * FT_MIN)) tier = U_URGENT;
+    else if (r <= (LONGLONG)FT_DAY) tier = U_NEAR;
+    else if (r <= (LONGLONG)(3 * FT_DAY)) tier = U_SOON;
+    else tier = U_NONE;
+    for (i = 0; i < 4; i++) {
+        ULONGLONG b = D - off[i];
+        if (b > now && (!best || b < best)) best = b;
+    }
+
+    if (tier == U_LATE) lstrcpyW(label, L"atrasada");
+    else if (it->time < 0 || r >= (LONGLONG)FT_DAY) {
+        int dd = DayDiff(Today(), it->date);
+        if (dd <= 0) lstrcpyW(label, L"hoje");
+        else if (dd == 1) lstrcpyW(label, L"amanhã");
+        else wsprintfW(label, L"em %d dias", dd);
+        /* muda na virada do dia, que já acorda o app */
+    } else if (r < (LONGLONG)(60 * FT_MIN)) {
+        LONGLONG m = (r + (LONGLONG)FT_MIN - 1) / (LONGLONG)FT_MIN;
+        wsprintfW(label, L"em %d min", (int)m);
+        ch = D - (ULONGLONG)(m - 1) * FT_MIN;
+    } else if (r <= (LONGLONG)(120 * FT_MIN)) {     /* "em 1h30" */
+        LONGLONG m = (r + (LONGLONG)FT_MIN - 1) / (LONGLONG)FT_MIN;
+        if (m >= 120) lstrcpyW(label, L"em 2h");
+        else if (m == 60) lstrcpyW(label, L"em 1h");
+        else wsprintfW(label, L"em 1h%02d", (int)(m - 60));
+        ch = D - (ULONGLONG)(m - 1) * FT_MIN;
+    } else {                                        /* "em 5h", arredondado para cima */
+        LONGLONG h = (r + (LONGLONG)(60 * FT_MIN) - 1) / (LONGLONG)(60 * FT_MIN);
+        wsprintfW(label, L"em %dh", (int)h);
+        ch = D - (ULONGLONG)(h - 1) * 60 * FT_MIN;
+    }
+    if (ch > now && (!best || ch < best)) best = ch;
+    if (next) *next = best;
+    return tier;
+}
+
+/* Primeiro dia >= d que está na máscara (para alinhar a data ao escolher os dias). */
+static DWORD AlignToDays(DWORD d, int mask)
+{
+    int guard = 0;
+    if (!(mask & WD_ALL) || !d) return d;
+    while (!(mask & (1 << WeekDay(d))) && ++guard < 8) d = AddDays(d, 1);
+    return d;
+}
+
+/* "Seg, Qua, Sex"; atalhos para dias úteis, fim de semana e todos. */
+static void DaysLabel(int mask, WCHAR *out, int cap)
+{
+    static const int order[7] = { 1, 2, 3, 4, 5, 6, 0 };   /* começa na segunda */
+    int i, n = 0;
+    out[0] = 0;
+    mask &= WD_ALL;
+    if (mask == WD_ALL) { lstrcpynW(out, L"Todo dia", cap); return; }
+    if (mask == 0x3E)   { lstrcpynW(out, L"Dias úteis", cap); return; }
+    if (mask == 0x41)   { lstrcpynW(out, L"Fim de semana", cap); return; }
+    for (i = 0; i < 7; i++)
+        if (mask & (1 << order[i]) && lstrlenW(out) + 6 < cap) {
+            if (n++) lstrcatW(out, L", ");
+            lstrcatW(out, kWdShort[order[i]]);
+        }
+    if (!n) lstrcpynW(out, L"Nenhum dia", cap);
+}
+
+/* Nome da repetição de uma tarefa (com os dias, quando for R_DAYS). */
+static void RecurLabel(int recur, int mask, WCHAR *out, int cap)
+{
+    if (recur == R_DAYS) DaysLabel(mask, out, cap);
+    else lstrcpynW(out, kRecurName[recur >= 0 && recur <= R_MONTHLY ? recur : 0], cap);
 }
